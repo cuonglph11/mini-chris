@@ -2,7 +2,10 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { glob } from 'glob';
 import OpenAI from 'openai';
+import { execa } from 'execa';
 import type { MemorySearchResult } from '../types.js';
+
+// ── Types ────────────────────────────────────────────────────────────────────
 
 export interface MemoryChunk {
   filePath: string;
@@ -17,7 +20,12 @@ export interface MemoryIndex {
   embeddingCache: Map<string, number[]>;
   apiKey: string;
   model: string;
+  provider: 'openai' | 'copilot' | 'keyword';
 }
+
+type EmbedFn = (text: string) => Promise<number[]>;
+
+// ── Chunking ─────────────────────────────────────────────────────────────────
 
 function splitIntoChunks(text: string, filePath: string, chunkSize = 500): MemoryChunk[] {
   const chunks: MemoryChunk[] = [];
@@ -43,7 +51,7 @@ function splitIntoChunks(text: string, filePath: string, chunkSize = 500): Memor
       currentChunk += paragraph + '\n\n';
     }
 
-    lineNumber += paragraphLines + 1; // +1 for the blank line between paragraphs
+    lineNumber += paragraphLines + 1;
   }
 
   if (currentChunk.trim().length > 0) {
@@ -58,13 +66,7 @@ function splitIntoChunks(text: string, filePath: string, chunkSize = 500): Memor
   return chunks;
 }
 
-async function embedText(text: string, client: OpenAI, model: string): Promise<number[]> {
-  const response = await client.embeddings.create({
-    model,
-    input: text,
-  });
-  return response.data[0].embedding;
-}
+// ── Cosine similarity ────────────────────────────────────────────────────────
 
 export function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0;
@@ -79,48 +81,169 @@ export function cosineSimilarity(a: number[], b: number[]): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
-export async function buildIndex(
-  workspacePath: string,
-  apiKey: string,
-  model = 'text-embedding-3-small'
-): Promise<MemoryIndex> {
-  const client = new OpenAI({ apiKey });
-  const embeddingCache = new Map<string, number[]>();
+// ── Embedding providers ──────────────────────────────────────────────────────
 
+function createOpenAIEmbed(apiKey: string, model: string): EmbedFn {
+  const client = new OpenAI({ apiKey });
+  return async (text: string) => {
+    const response = await client.embeddings.create({ model, input: text });
+    return response.data[0].embedding;
+  };
+}
+
+async function getCopilotToken(): Promise<string> {
+  for (const envVar of ['COPILOT_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
+    const val = process.env[envVar];
+    if (val) return val;
+  }
+  const result = await execa('gh', ['auth', 'token'], { reject: false });
+  if (result.exitCode === 0 && result.stdout) return result.stdout.trim();
+  throw new Error('No GitHub token available');
+}
+
+function createCopilotEmbed(): EmbedFn {
+  let tokenPromise: Promise<string> | null = null;
+  return async (text: string) => {
+    if (!tokenPromise) tokenPromise = getCopilotToken();
+    const token = await tokenPromise;
+
+    const response = await fetch('https://api.githubcopilot.com/embeddings', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'GitHubCopilotChat/0.35.0',
+        'Editor-Version': 'vscode/1.107.0',
+        'Editor-Plugin-Version': 'copilot-chat/0.35.0',
+        'Copilot-Integration-Id': 'vscode-chat',
+      },
+      body: JSON.stringify({
+        model: 'text-embedding-3-small',
+        input: text,
+      }),
+    });
+
+    if (!response.ok) throw new Error(`Copilot embeddings ${response.status}`);
+    const data = await response.json() as { data: Array<{ embedding: number[] }> };
+    return data.data[0].embedding;
+  };
+}
+
+// ── Keyword search (fallback 3: no API needed) ──────────────────────────────
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2);
+}
+
+function keywordScore(query: string, content: string): number {
+  const queryTokens = tokenize(query);
+  const contentTokens = new Set(tokenize(content));
+  if (queryTokens.length === 0) return 0;
+
+  let matches = 0;
+  for (const token of queryTokens) {
+    if (contentTokens.has(token)) {
+      matches++;
+    } else {
+      // Partial match: check if any content token contains the query token
+      for (const ct of contentTokens) {
+        if (ct.includes(token) || token.includes(ct)) {
+          matches += 0.5;
+          break;
+        }
+      }
+    }
+  }
+
+  // Normalize by query length, boost shorter content (more focused)
+  const relevance = matches / queryTokens.length;
+  const brevityBonus = Math.min(1, 200 / Math.max(content.length, 1));
+  return relevance * 0.8 + relevance * brevityBonus * 0.2;
+}
+
+// ── Load chunks from workspace ───────────────────────────────────────────────
+
+async function loadChunks(workspacePath: string): Promise<MemoryChunk[]> {
   const allChunks: MemoryChunk[] = [];
 
-  // Read MEMORY.md
   const memoryPath = join(workspacePath, 'MEMORY.md');
   try {
     const content = await readFile(memoryPath, 'utf-8');
     allChunks.push(...splitIntoChunks(content, memoryPath));
-  } catch {
-    // Skip if missing
-  }
+  } catch { /* skip */ }
 
-  // Read all memory/*.md files
   const pattern = join(workspacePath, 'memory', '*.md');
   const memFiles = await glob(pattern);
   for (const filePath of memFiles) {
     try {
       const content = await readFile(filePath, 'utf-8');
       allChunks.push(...splitIntoChunks(content, filePath));
-    } catch {
-      // Skip unreadable files
-    }
+    } catch { /* skip */ }
   }
 
-  // Embed all chunks
-  for (const chunk of allChunks) {
-    if (!embeddingCache.has(chunk.content)) {
-      const embedding = await embedText(chunk.content, client, model);
-      embeddingCache.set(chunk.content, embedding);
-    }
-    chunk.embedding = embeddingCache.get(chunk.content);
-  }
-
-  return { chunks: allChunks, embeddingCache, apiKey, model };
+  return allChunks;
 }
+
+// ── Build index with fallback chain ──────────────────────────────────────────
+
+export async function buildIndex(
+  workspacePath: string,
+  apiKey: string,
+  model = 'text-embedding-3-small'
+): Promise<MemoryIndex> {
+  const allChunks = await loadChunks(workspacePath);
+  const embeddingCache = new Map<string, number[]>();
+
+  if (allChunks.length === 0) {
+    return { chunks: allChunks, embeddingCache, apiKey, model, provider: 'keyword' };
+  }
+
+  // Try embedding providers in order: OpenAI → Copilot → Keyword
+  const providers: Array<{ name: 'openai' | 'copilot'; create: () => EmbedFn }> = [];
+
+  if (apiKey) {
+    providers.push({ name: 'openai', create: () => createOpenAIEmbed(apiKey, model) });
+  }
+  providers.push({ name: 'copilot', create: () => createCopilotEmbed() });
+
+  for (const { name, create } of providers) {
+    try {
+      const embed = create();
+      // Test with first chunk to verify the provider works
+      const testEmbedding = await embed(allChunks[0].content.slice(0, 100));
+      if (!testEmbedding || testEmbedding.length === 0) throw new Error('Empty embedding');
+
+      // Provider works — embed all chunks
+      embeddingCache.set(allChunks[0].content, testEmbedding);
+      allChunks[0].embedding = testEmbedding;
+
+      for (let i = 1; i < allChunks.length; i++) {
+        const chunk = allChunks[i];
+        if (!embeddingCache.has(chunk.content)) {
+          const embedding = await embed(chunk.content);
+          embeddingCache.set(chunk.content, embedding);
+        }
+        chunk.embedding = embeddingCache.get(chunk.content);
+      }
+
+      console.error(`[memory] Using ${name} embeddings (${allChunks.length} chunks indexed)`);
+      return { chunks: allChunks, embeddingCache, apiKey, model, provider: name };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[memory] ${name} embeddings failed: ${msg}, trying next...`);
+    }
+  }
+
+  // All embedding providers failed — fall back to keyword search
+  console.error(`[memory] Using keyword search fallback (${allChunks.length} chunks)`);
+  return { chunks: allChunks, embeddingCache, apiKey, model, provider: 'keyword' };
+}
+
+// ── Search with fallback ─────────────────────────────────────────────────────
 
 export async function searchMemory(
   query: string,
@@ -128,15 +251,54 @@ export async function searchMemory(
   apiKey: string,
   topN = 5
 ): Promise<MemorySearchResult[]> {
-  const client = new OpenAI({ apiKey });
-  const queryEmbedding = await embedText(query, client, index.model);
 
-  const scored = index.chunks
-    .filter((chunk) => chunk.embedding !== undefined)
+  if (index.provider === 'keyword' || index.chunks.every(c => !c.embedding)) {
+    // Keyword fallback
+    return keywordSearch(query, index.chunks, topN);
+  }
+
+  // Embedding search — use same provider that built the index
+  try {
+    let embed: EmbedFn;
+    if (index.provider === 'openai' && apiKey) {
+      embed = createOpenAIEmbed(apiKey, index.model);
+    } else if (index.provider === 'copilot') {
+      embed = createCopilotEmbed();
+    } else {
+      return keywordSearch(query, index.chunks, topN);
+    }
+
+    const queryEmbedding = await embed(query);
+
+    const scored = index.chunks
+      .filter((chunk) => chunk.embedding !== undefined)
+      .map((chunk) => ({
+        chunk,
+        score: cosineSimilarity(queryEmbedding, chunk.embedding!),
+      }));
+
+    scored.sort((a, b) => b.score - a.score);
+
+    return scored.slice(0, topN).map(({ chunk, score }) => ({
+      content: chunk.content,
+      filePath: chunk.filePath,
+      lineStart: chunk.lineStart,
+      lineEnd: chunk.lineEnd,
+      score,
+    }));
+  } catch {
+    // If embedding search fails at query time, fall back to keyword
+    return keywordSearch(query, index.chunks, topN);
+  }
+}
+
+function keywordSearch(query: string, chunks: MemoryChunk[], topN: number): MemorySearchResult[] {
+  const scored = chunks
     .map((chunk) => ({
       chunk,
-      score: cosineSimilarity(queryEmbedding, chunk.embedding!),
-    }));
+      score: keywordScore(query, chunk.content),
+    }))
+    .filter(({ score }) => score > 0);
 
   scored.sort((a, b) => b.score - a.score);
 

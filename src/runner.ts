@@ -24,15 +24,29 @@ function applyOptions(config: AppConfig, options: RunOptions): AppConfig {
   };
 }
 
-async function buildSystemPrompt(task: string, config: AppConfig): Promise<string> {
+interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+function formatHistory(history: ChatTurn[]): string {
+  if (history.length === 0) return '';
+  return '\n## Conversation History\n' + history.map(t =>
+    t.role === 'user' ? `User: ${t.content}` : `Assistant: ${t.content}`
+  ).join('\n') + '\n';
+}
+
+async function buildSystemPrompt(task: string, config: AppConfig, history: ChatTurn[] = []): Promise<string> {
   const [memoryContext, skillContext] = await Promise.all([
     injectWorkspaceContext(config.workspace),
     injectSkill(task, config.workspace),
   ]);
 
-  const parts: string[] = ['You are mini-chris, a helpful AI assistant.'];
+  const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.'];
   if (memoryContext) parts.push('\n## Workspace Context\n' + memoryContext);
   if (skillContext) parts.push('\n## Active Skill\n' + skillContext);
+  const historyBlock = formatHistory(history);
+  if (historyBlock) parts.push(historyBlock);
   return parts.join('\n');
 }
 
@@ -41,8 +55,10 @@ async function runTurn(
   config: AppConfig,
   router: ToolRouter,
   tools: ToolDefinition[],
-): Promise<void> {
-  const systemPrompt = await buildSystemPrompt(task, config);
+  history: ChatTurn[] = [],
+): Promise<string> {
+  const systemPrompt = await buildSystemPrompt(task, config, history);
+  let assistantText = '';
   const adapter = createAdapter(config.adapter, config);
 
   for await (const event of adapter.run({
@@ -55,6 +71,7 @@ async function runTurn(
   })) {
     switch (event.type) {
       case 'text':
+        assistantText += event.content;
         process.stdout.write(event.content);
         break;
       case 'tool_call': {
@@ -90,6 +107,7 @@ async function runTurn(
         break;
     }
   }
+  return assistantText;
 }
 
 export async function runTask(task: string, options: RunOptions = {}): Promise<void> {
@@ -123,6 +141,8 @@ export async function startChat(options: RunOptions = {}): Promise<void> {
       rl.question(chalk.blue('you> '), resolve);
     });
 
+  const history: ChatTurn[] = [];
+
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -139,7 +159,14 @@ export async function startChat(options: RunOptions = {}): Promise<void> {
 
       process.stdout.write(chalk.green('assistant> '));
       try {
-        await runTurn(input, config, router, tools);
+        const response = await runTurn(input, config, router, tools, history);
+        history.push({ role: 'user', content: input });
+        if (response) {
+          const summary = response.length > 500 ? response.slice(0, 500) + '...' : response;
+          history.push({ role: 'assistant', content: summary });
+        }
+        // Cap history
+        if (history.length > 40) history.splice(0, history.length - 40);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(chalk.red(`\nError: ${msg}\n`));

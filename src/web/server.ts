@@ -137,13 +137,34 @@ export async function startServer(port = 3000, configPath?: string): Promise<voi
   });
 }
 
+interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+function formatConversationHistory(history: ChatTurn[]): string {
+  if (history.length === 0) return '';
+  const lines = history.map(t =>
+    t.role === 'user' ? `User: ${t.content}` : `Assistant: ${t.content}`
+  );
+  return '\n## Conversation History\n' + lines.join('\n') + '\n';
+}
+
 function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter) {
+  // Per-connection conversation history
+  const history: ChatTurn[] = [];
+
   ws.on('message', async (raw) => {
     let msg: { type: string; content: string; model?: string };
     try {
       msg = JSON.parse(raw.toString());
     } catch {
       ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+      return;
+    }
+
+    if (msg.type === 'clear_history') {
+      history.length = 0;
       return;
     }
 
@@ -159,13 +180,20 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
         injectSkill(task, config.workspace),
       ]);
 
-      const parts: string[] = ['You are mini-chris, a helpful AI assistant.'];
+      const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.'];
       if (memoryContext) parts.push('\n## Workspace Context\n' + memoryContext);
       if (skillContext) parts.push('\n## Active Skill\n' + skillContext);
+
+      // Inject conversation history so the agent remembers prior turns
+      const historyBlock = formatConversationHistory(history);
+      if (historyBlock) parts.push(historyBlock);
+
       const systemPrompt = parts.join('\n');
 
       const effectiveConfig = msg.model ? { ...config, model: msg.model } : config;
       const adapter = createAdapter(effectiveConfig.adapter, effectiveConfig);
+
+      let assistantText = '';
 
       for await (const event of adapter.run({
         systemPrompt,
@@ -179,6 +207,7 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
 
         switch (event.type) {
           case 'text':
+            assistantText += event.content;
             ws.send(JSON.stringify({ type: 'text', content: event.content }));
             break;
           case 'tool_call': {
@@ -193,7 +222,6 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
                 ws.send(JSON.stringify({ type: 'tool_result', id: event.id, result: (e as Error).message, isError: true }));
               }
             }
-            // Cursor built-in tools: result will arrive as a separate tool_result event from the adapter
             break;
           }
           case 'error':
@@ -203,6 +231,17 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
             ws.send(JSON.stringify({ type: 'done', usage: event.usage }));
             break;
         }
+      }
+
+      // Save this turn to history (cap at 20 turns to avoid prompt overflow)
+      history.push({ role: 'user', content: task });
+      if (assistantText) {
+        // Truncate long responses in history to save context space
+        const summary = assistantText.length > 500 ? assistantText.slice(0, 500) + '...' : assistantText;
+        history.push({ role: 'assistant', content: summary });
+      }
+      if (history.length > 40) {
+        history.splice(0, history.length - 40);
       }
     } catch (e) {
       ws.send(JSON.stringify({ type: 'error', message: (e as Error).message }));

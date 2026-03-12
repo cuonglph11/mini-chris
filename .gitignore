@@ -25,3 +25,6 @@ Thumbs.db
 # Workspace (if it contains temporary files)
 workspace/tmp/
 workspace/.cache/
+
+# Documentation
+REQUIREMENTS.md

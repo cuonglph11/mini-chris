@@ -1,0 +1,18 @@
+services:
+  mini-chris:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      # GitHub Copilot auth (pick one)
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      # OpenAI for memory search (optional)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      # Persist workspace memory across restarts
+      - ./workspace:/app/workspace
+      # Custom config (optional)
+      - ./config.yaml:/app/config.yaml:ro
+      # Custom MCP servers (optional)
+      - ./mcp-servers.json:/app/mcp-servers.json:ro
+    restart: unless-stopped

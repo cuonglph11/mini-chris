@@ -1,8 +1,11 @@
 {
-  "example": {
+  "vibium": {
     "transport": "stdio",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-everything"],
-    "env": {}
+    "args": [
+      "-y",
+      "vibium",
+      "mcp"
+    ]
   }
 }

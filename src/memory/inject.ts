@@ -8,6 +8,7 @@ const WORKSPACE_FILES = [
   'MEMORY.md',
   'AGENTS.md',
   'TOOLS.md',
+  'BOOTSTRAP.md',
 ];
 
 const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB

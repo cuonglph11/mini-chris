@@ -602,6 +602,10 @@ function clearChat() {
   welcome.innerHTML = '<div class="content">Hello! I\'m <strong>mini-chris</strong>. How can I help you today?</div>';
   messagesEl.appendChild(welcome);
   scrollToBottom();
+  // Tell server to clear conversation history
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'clear_history' }));
+  }
 }
 
 // ── Chat sessions ─────────────────────────────────────────────────────────────
