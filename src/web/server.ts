@@ -16,6 +16,9 @@ import { ToolRouter } from '../mcp/tool-router.js';
 import { getCopilotSessionToken, COPILOT_HEADERS } from '../copilot-auth.js';
 import { proxyFetch } from '../net.js';
 import type { AppConfig, ToolDefinition } from '../types.js';
+import { getBuiltInTools } from '../agents/tools.js';
+import { runSubAgent } from '../agents/sub-agent.js';
+import { getMemoryTools, executeMemorySearch, executeMemorySave } from '../memory/tools.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -190,7 +193,7 @@ function formatConversationHistory(history: ChatTurn[]): string {
   return '\n## Conversation History\n' + lines.join('\n') + '\n';
 }
 
-const WS_MAX_TOOL_ROUNDS = 10;
+// maxToolRounds is now read from config
 
 function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter) {
   const history: ChatTurn[] = [];
@@ -213,7 +216,10 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
 
     const task = msg.content;
     const tools = router.getTools();
+    const builtInTools = [...getBuiltInTools(), ...getMemoryTools()];
+    const allTools = [...tools, ...builtInTools];
     const mcpToolNames = new Set(tools.map(t => t.name));
+    const builtInToolNames = new Set(builtInTools.map(t => t.name));
 
     try {
       const [memoryContext, skillContext] = await Promise.all([
@@ -221,7 +227,7 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
         injectSkill(task, config.workspace),
       ]);
 
-      const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.'];
+      const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.\n\nYou have these built-in tools:\n- `delegate_task` — spin up a sub-agent for complex sub-tasks (runs in its own context with MCP tools)\n- `memory_search` — search long-term memory before answering questions about past work, preferences, or decisions\n- `memory_save` — save important facts, preferences, and decisions to long-term memory\n\nProactively use memory_save when the user shares preferences, makes decisions, or corrects you. Use memory_search before answering from memory.'];
       if (memoryContext) parts.push('\n## Workspace Context\n' + memoryContext);
       if (skillContext) parts.push('\n## Active Skill\n' + skillContext);
       const historyBlock = formatConversationHistory(history);
@@ -244,7 +250,7 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
               break;
             case 'tool_call': {
               ws.send(JSON.stringify({ type: 'tool_call', id: event.id, name: event.name, args: event.args }));
-              if (mcpToolNames.has(event.name)) {
+              if (mcpToolNames.has(event.name) || builtInToolNames.has(event.name)) {
                 pendingToolCalls.push({ id: event.id, name: event.name, args: event.args });
               }
               break;
@@ -261,18 +267,39 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
       };
 
       let pendingToolCalls = await processStream(adapter.run({
-        systemPrompt, task, tools, model: effectiveConfig.model, cwd: effectiveConfig.cwd, stream: true,
+        systemPrompt, task, tools: allTools, model: effectiveConfig.model, cwd: effectiveConfig.cwd, stream: true,
       }));
 
       let round = 0;
-      while (pendingToolCalls.length > 0 && adapter.addToolResult && adapter.continueAfterToolCall && round < WS_MAX_TOOL_ROUNDS) {
+      while (pendingToolCalls.length > 0 && adapter.addToolResult && adapter.continueAfterToolCall && round < effectiveConfig.maxToolRounds) {
         round++;
         for (const tc of pendingToolCalls) {
           try {
-            const result = await router.routeToolCall({ id: tc.id, name: tc.name, args: tc.args });
-            const resultStr = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
-            ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: result.result, isError: result.isError }));
-            adapter.addToolResult(tc.id, resultStr);
+            if (tc.name === 'delegate_task') {
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: '[delegating to sub-agent...]', isError: false }));
+              const subResult = await runSubAgent({
+                task: tc.args.task as string,
+                config: effectiveConfig,
+                router,
+                tools: allTools,
+                parentContext: tc.args.context as string | undefined,
+              });
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: '[sub-agent completed]', isError: false }));
+              adapter.addToolResult(tc.id, subResult);
+            } else if (tc.name === 'memory_search') {
+              const resultStr = await executeMemorySearch(tc.args, config.workspace, config.embedding.apiKey, config.embedding.model);
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
+              adapter.addToolResult(tc.id, resultStr);
+            } else if (tc.name === 'memory_save') {
+              const resultStr = await executeMemorySave(tc.args, config.workspace);
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
+              adapter.addToolResult(tc.id, resultStr);
+            } else {
+              const result = await router.routeToolCall({ id: tc.id, name: tc.name, args: tc.args });
+              const resultStr = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: result.result, isError: result.isError }));
+              adapter.addToolResult(tc.id, resultStr);
+            }
           } catch (e) {
             const errMsg = (e as Error).message;
             ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: errMsg, isError: true }));
@@ -283,7 +310,7 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
         if (ws.readyState !== WebSocket.OPEN) break;
 
         pendingToolCalls = await processStream(adapter.continueAfterToolCall({
-          systemPrompt, tools, model: effectiveConfig.model, cwd: effectiveConfig.cwd,
+          systemPrompt, tools: allTools, model: effectiveConfig.model, cwd: effectiveConfig.cwd,
         }));
       }
 

@@ -7,6 +7,10 @@ import { injectSkill } from './skills/runner.js';
 import { loadRegistry } from './mcp/registry.js';
 import { ToolRouter } from './mcp/tool-router.js';
 import type { AdapterEvent, AppConfig, ToolDefinition } from './types.js';
+import { getBuiltInTools } from './agents/tools.js';
+import { runSubAgent } from './agents/sub-agent.js';
+import { getMemoryTools, executeMemorySearch, executeMemorySave } from './memory/tools.js';
+import { shouldFlushMemory, buildFlushPrompt, DEFAULT_FLUSH_CONFIG } from './memory/flush.js';
 
 export interface RunOptions {
   adapter?: string;
@@ -42,15 +46,13 @@ async function buildSystemPrompt(task: string, config: AppConfig, history: ChatT
     injectSkill(task, config.workspace),
   ]);
 
-  const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.'];
+  const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.\n\nYou have these built-in tools:\n- `delegate_task` — spin up a sub-agent for complex sub-tasks (runs in its own context with MCP tools)\n- `memory_search` — search long-term memory before answering questions about past work, preferences, or decisions\n- `memory_save` — save important facts, preferences, and decisions to long-term memory\n\nProactively use memory_save when the user shares preferences, makes decisions, or corrects you. Use memory_search before answering from memory.'];
   if (memoryContext) parts.push('\n## Workspace Context\n' + memoryContext);
   if (skillContext) parts.push('\n## Active Skill\n' + skillContext);
   const historyBlock = formatHistory(history);
   if (historyBlock) parts.push(historyBlock);
   return parts.join('\n');
 }
-
-const MAX_TOOL_ROUNDS = 10;
 
 async function runTurn(
   task: string,
@@ -62,7 +64,10 @@ async function runTurn(
   const systemPrompt = await buildSystemPrompt(task, config, history);
   let assistantText = '';
   const adapter = createAdapter(config.adapter, config);
+  const builtInTools = [...getBuiltInTools(), ...getMemoryTools()];
+  const allTools = [...tools, ...builtInTools];
   const mcpToolNames = new Set(tools.map(t => t.name));
+  const builtInToolNames = new Set(builtInTools.map(t => t.name));
 
   const processStream = async (stream: AsyncIterable<AdapterEvent>): Promise<{ pendingToolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> }> => {
     const pendingToolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> = [];
@@ -76,7 +81,7 @@ async function runTurn(
           process.stdout.write(
             chalk.cyan(`\n[tool: ${event.name}] `) + chalk.dim(JSON.stringify(event.args)) + '\n',
           );
-          if (mcpToolNames.has(event.name)) {
+          if (mcpToolNames.has(event.name) || builtInToolNames.has(event.name)) {
             pendingToolCalls.push({ id: event.id, name: event.name, args: event.args });
           } else {
             process.stdout.write(chalk.dim('[handled by adapter]\n'));
@@ -99,22 +104,50 @@ async function runTurn(
   };
 
   let { pendingToolCalls } = await processStream(adapter.run({
-    systemPrompt, task, tools, model: config.model, cwd: config.cwd, stream: true,
+    systemPrompt, task, tools: allTools, model: config.model, cwd: config.cwd, stream: true,
   }));
 
   let round = 0;
-  while (pendingToolCalls.length > 0 && adapter.addToolResult && adapter.continueAfterToolCall && round < MAX_TOOL_ROUNDS) {
+  while (pendingToolCalls.length > 0 && adapter.addToolResult && adapter.continueAfterToolCall && round < config.maxToolRounds) {
     round++;
     for (const tc of pendingToolCalls) {
-      const result = await router.routeToolCall({ id: tc.id, name: tc.name, args: tc.args });
-      const status = result.isError ? chalk.red('[error]') : chalk.green('[ok]');
-      process.stdout.write(chalk.cyan('[result] ') + status + '\n');
-      const resultStr = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+      let resultStr: string;
+
+      if (tc.name === 'delegate_task') {
+        process.stdout.write(chalk.magenta('[delegating to sub-agent...]\n'));
+        try {
+          const subResult = await runSubAgent({
+            task: tc.args.task as string,
+            config,
+            router,
+            tools: allTools,
+            parentContext: tc.args.context as string | undefined,
+          });
+          resultStr = subResult;
+          process.stdout.write(chalk.magenta('[sub-agent completed]\n'));
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          resultStr = `Sub-agent error: ${errMsg}`;
+          process.stdout.write(chalk.red(`[sub-agent error: ${errMsg}]\n`));
+        }
+      } else if (tc.name === 'memory_search') {
+        resultStr = await executeMemorySearch(tc.args, config.workspace, config.embedding.apiKey, config.embedding.model);
+        process.stdout.write(chalk.cyan('[result] ') + chalk.green('[ok]') + '\n');
+      } else if (tc.name === 'memory_save') {
+        resultStr = await executeMemorySave(tc.args, config.workspace);
+        process.stdout.write(chalk.cyan('[result] ') + chalk.green('[saved]') + '\n');
+      } else {
+        const result = await router.routeToolCall({ id: tc.id, name: tc.name, args: tc.args });
+        const status = result.isError ? chalk.red('[error]') : chalk.green('[ok]');
+        process.stdout.write(chalk.cyan('[result] ') + status + '\n');
+        resultStr = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+      }
+
       adapter.addToolResult(tc.id, resultStr);
     }
 
     ({ pendingToolCalls } = await processStream(adapter.continueAfterToolCall({
-      systemPrompt, tools, model: config.model, cwd: config.cwd,
+      systemPrompt, tools: allTools, model: config.model, cwd: config.cwd,
     })));
   }
 
@@ -153,6 +186,9 @@ export async function startChat(options: RunOptions = {}): Promise<void> {
     });
 
   const history: ChatTurn[] = [];
+  let turnCount = 0;
+  let lastFlushAtTurn = 0;
+  const flushConfig = DEFAULT_FLUSH_CONFIG;
 
   try {
     // eslint-disable-next-line no-constant-condition
@@ -168,6 +204,8 @@ export async function startChat(options: RunOptions = {}): Promise<void> {
       if (!input) continue;
       if (input === 'exit' || input === 'quit') break;
 
+      turnCount++;
+
       process.stdout.write(chalk.green('assistant> '));
       try {
         const response = await runTurn(input, config, router, tools, history);
@@ -178,6 +216,18 @@ export async function startChat(options: RunOptions = {}): Promise<void> {
         }
         // Cap history
         if (history.length > 40) history.splice(0, history.length - 40);
+
+        // Memory flush check
+        if (shouldFlushMemory({ turnCount, lastFlushAtTurn, config: flushConfig })) {
+          lastFlushAtTurn = turnCount;
+          process.stderr.write(chalk.dim('\n[memory flush: saving important context...]\n'));
+          const flush = buildFlushPrompt(flushConfig);
+          try {
+            await runTurn(flush.userPrompt, config, router, tools, history);
+          } catch {
+            process.stderr.write(chalk.dim('[memory flush: skipped due to error]\n'));
+          }
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(chalk.red(`\nError: ${msg}\n`));

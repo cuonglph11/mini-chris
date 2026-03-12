@@ -4,6 +4,13 @@ import type { MemorySearchResult } from '../types.js';
 export { injectWorkspaceContext } from './inject.js';
 export { appendToMemory, appendToDailyLog, syncMemory } from './persist.js';
 export { buildIndex, cosineSimilarity } from './search.js';
+export {
+  DEFAULT_FLUSH_CONFIG,
+  shouldFlushMemory,
+  buildFlushPrompt,
+} from './flush.js';
+export type { FlushConfig } from './flush.js';
+export { getMemoryTools, executeMemorySearch, executeMemorySave, resetMemoryCache } from './tools.js';
 
 /**
  * Convenience wrapper: builds the embedding index then searches it.

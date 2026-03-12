@@ -27,6 +27,7 @@ const AppConfigSchema = z.object({
   model: z.string().default('auto'),
   cwd: z.string().default('.'),
   workspace: z.string().default('./workspace'),
+  maxToolRounds: z.number().int().min(1).default(50),
   embedding: z
     .object({
       provider: z.string().default('openai'),

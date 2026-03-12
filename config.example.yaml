@@ -2,6 +2,7 @@ adapter: cursor                    # cursor | copilot
 model: auto                        # model name or "auto"
 cwd: .                             # default working directory
 workspace: ./workspace             # path to workspace dir
+maxToolRounds: 50                  # max tool call rounds per turn
 
 # Embedding for memory search
 embedding:

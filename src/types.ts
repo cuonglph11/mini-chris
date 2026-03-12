@@ -72,6 +72,7 @@ export interface AppConfig {
   model: string;
   cwd: string;
   workspace: string;
+  maxToolRounds: number;
   embedding: {
     provider: string;
     model: string;

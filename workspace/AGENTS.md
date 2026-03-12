@@ -29,6 +29,24 @@ When a new session begins:
 - Fact or preference in a single clear sentence
 ```
 
+## Memory Discipline
+
+### Proactive Memory Writing
+- When the user shares personal info, preferences, or corrections → save immediately
+- When a significant decision is made → save it with context
+- When you discover project patterns or conventions → save them
+- When the user explicitly says "remember this" → save it
+
+### Before Answering from Memory
+- Always use `memory_search` before answering questions about past work, decisions, or preferences
+- If memory_search returns nothing, say so honestly rather than guessing
+
+### Memory Flush
+- When prompted with a memory flush instruction, review the conversation and save anything important
+- Focus on: user preferences, decisions made, project facts, corrections received
+- Use concise, factual language — one bullet point per fact
+- Don't save ephemeral details (specific error messages, debugging steps, etc.)
+
 ## Task Execution
 
 ### Before Starting
