@@ -19,6 +19,7 @@ import type { AppConfig, ToolDefinition } from '../types.js';
 import { getBuiltInTools } from '../agents/tools.js';
 import { runSubAgent } from '../agents/sub-agent.js';
 import { getMemoryTools, executeMemorySearch, executeMemorySave } from '../memory/tools.js';
+import { getSystemTools, executeExec, executeReadFile, executeWriteFile, executeWebFetch } from '../agents/system-tools.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -216,7 +217,7 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
 
     const task = msg.content;
     const tools = router.getTools();
-    const builtInTools = [...getBuiltInTools(), ...getMemoryTools()];
+    const builtInTools = [...getBuiltInTools(), ...getMemoryTools(), ...getSystemTools()];
     const allTools = [...tools, ...builtInTools];
     const mcpToolNames = new Set(tools.map(t => t.name));
     const builtInToolNames = new Set(builtInTools.map(t => t.name));
@@ -227,7 +228,7 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
         injectSkill(task, config.workspace),
       ]);
 
-      const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.\n\nYou have these built-in tools:\n- `delegate_task` — spin up a sub-agent for complex sub-tasks (runs in its own context with MCP tools)\n- `memory_search` — search long-term memory before answering questions about past work, preferences, or decisions\n- `memory_save` — save important facts, preferences, and decisions to long-term memory\n\nProactively use memory_save when the user shares preferences, makes decisions, or corrects you. Use memory_search before answering from memory.'];
+      const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.\n\nYou have these built-in tools:\n- `exec` — run shell commands (docker ps, git status, npm test, ls, etc.)\n- `read_file` — read file contents\n- `write_file` — create or update files\n- `web_fetch` — fetch URL content (web pages, APIs)\n- `delegate_task` — spin up a sub-agent for complex sub-tasks (runs in its own context)\n- `memory_search` — search long-term memory for past decisions, preferences, facts\n- `memory_save` — save important info to long-term memory\n\nUse exec for system commands, read_file/write_file for file operations. Proactively use memory_save when the user shares preferences or decisions. Use memory_search before answering from memory.'];
       if (memoryContext) parts.push('\n## Workspace Context\n' + memoryContext);
       if (skillContext) parts.push('\n## Active Skill\n' + skillContext);
       const historyBlock = formatConversationHistory(history);
@@ -292,6 +293,23 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
               adapter.addToolResult(tc.id, resultStr);
             } else if (tc.name === 'memory_save') {
               const resultStr = await executeMemorySave(tc.args, config.workspace);
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
+              adapter.addToolResult(tc.id, resultStr);
+            } else if (tc.name === 'exec') {
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: `[exec] ${(tc.args.command as string) || ''}`, isError: false }));
+              const resultStr = await executeExec(tc.args, effectiveConfig.cwd);
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
+              adapter.addToolResult(tc.id, resultStr);
+            } else if (tc.name === 'read_file') {
+              const resultStr = await executeReadFile(tc.args, effectiveConfig.cwd);
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
+              adapter.addToolResult(tc.id, resultStr);
+            } else if (tc.name === 'write_file') {
+              const resultStr = await executeWriteFile(tc.args, effectiveConfig.cwd);
+              ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
+              adapter.addToolResult(tc.id, resultStr);
+            } else if (tc.name === 'web_fetch') {
+              const resultStr = await executeWebFetch(tc.args);
               ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
               adapter.addToolResult(tc.id, resultStr);
             } else {
