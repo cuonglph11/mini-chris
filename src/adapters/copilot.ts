@@ -3,7 +3,14 @@ import { createParser } from 'eventsource-parser';
 import { type Adapter, type AdapterEvent, type AppConfig, type ToolDefinition } from '../types.js';
 
 const COPILOT_API_URL = 'https://api.githubcopilot.com/chat/completions';
-const EDITOR_VERSION = 'mini-chris/0.1.0';
+
+// Use VS Code-like headers to avoid enterprise 421 errors
+const HEADERS_COMPAT = {
+  'User-Agent': 'GitHubCopilotChat/0.35.0',
+  'Editor-Version': 'vscode/1.107.0',
+  'Editor-Plugin-Version': 'copilot-chat/0.35.0',
+  'Copilot-Integration-Id': 'vscode-chat',
+};
 
 interface ToolCallAccumulator {
   id: string;
@@ -11,24 +18,49 @@ interface ToolCallAccumulator {
   argumentsJson: string;
 }
 
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content?: string;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+}
+
 export class CopilotAdapter implements Adapter {
   name = 'copilot';
+  private conversationHistory: ChatMessage[] = [];
 
   constructor(private config: AppConfig) {}
 
   private async getToken(): Promise<string> {
+    // 1. Direct token from config
     if (this.config.copilot.auth === 'token') {
       const token = this.config.copilot.token;
       if (!token) throw new Error('copilot.token is required when auth is "token"');
       return token;
     }
 
-    // auth === 'gh'
+    // 2. Environment variable fallback chain
+    for (const envVar of ['COPILOT_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
+      const val = process.env[envVar];
+      if (val) return val;
+    }
+
+    // 3. gh CLI auth
     const result = await execa('gh', ['auth', 'token'], { reject: false });
     if (result.exitCode !== 0) {
-      throw new Error(`Failed to get GitHub token via gh: ${result.stderr}`);
+      throw new Error(
+        `Failed to get GitHub token. Set GITHUB_TOKEN env var or run 'gh auth login'. Error: ${result.stderr}`,
+      );
     }
     return (result.stdout as string).trim();
+  }
+
+  resetHistory(): void {
+    this.conversationHistory = [];
   }
 
   async *run(options: {
@@ -60,12 +92,25 @@ export class CopilotAdapter implements Adapter {
       },
     }));
 
+    // Build messages with conversation history for multi-turn support
+    const messages: ChatMessage[] = [];
+
+    // System prompt always first
+    messages.push({ role: 'system', content: options.systemPrompt });
+
+    // Append prior conversation history (skip system messages from history)
+    for (const msg of this.conversationHistory) {
+      if (msg.role !== 'system') {
+        messages.push(msg);
+      }
+    }
+
+    // Add current user message
+    messages.push({ role: 'user', content: options.task });
+
     const body = {
       model,
-      messages: [
-        { role: 'system', content: options.systemPrompt },
-        { role: 'user', content: options.task },
-      ],
+      messages,
       tools: tools.length > 0 ? tools : undefined,
       stream: true,
     };
@@ -77,8 +122,7 @@ export class CopilotAdapter implements Adapter {
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
-          'Editor-Version': EDITOR_VERSION,
-          'Copilot-Integration-Id': 'mini-chris',
+          ...HEADERS_COMPAT,
         },
         body: JSON.stringify(body),
       });
@@ -106,6 +150,7 @@ export class CopilotAdapter implements Adapter {
     const eventQueue: AdapterEvent[] = [];
     let done = false;
     let usage: { inputTokens: number; outputTokens: number } | undefined;
+    let assistantText = '';
 
     // Accumulate partial tool call arguments indexed by tool_call index
     const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
@@ -141,10 +186,11 @@ export class CopilotAdapter implements Adapter {
 
         // Text content
         if (typeof delta['content'] === 'string' && delta['content'].length > 0) {
+          assistantText += delta['content'];
           eventQueue.push({ type: 'text', content: delta['content'] });
         }
 
-        // Tool calls
+        // Tool calls — emit as soon as complete
         if (Array.isArray(delta['tool_calls'])) {
           for (const tc of delta['tool_calls'] as Array<Record<string, unknown>>) {
             const idx = typeof tc['index'] === 'number' ? tc['index'] : 0;
@@ -196,6 +242,7 @@ export class CopilotAdapter implements Adapter {
     }
 
     // Emit accumulated tool calls
+    const toolCallsForHistory: ChatMessage['tool_calls'] = [];
     for (const [, acc] of toolCallAccumulators) {
       let args: Record<string, unknown>;
       try {
@@ -204,8 +251,38 @@ export class CopilotAdapter implements Adapter {
         args = { _raw: acc.argumentsJson };
       }
       yield { type: 'tool_call', id: acc.id, name: acc.name, args };
+      toolCallsForHistory.push({
+        id: acc.id,
+        type: 'function',
+        function: { name: acc.name, arguments: acc.argumentsJson || '{}' },
+      });
+    }
+
+    // Save to conversation history for multi-turn support
+    this.conversationHistory.push({ role: 'user', content: options.task });
+    if (assistantText || toolCallsForHistory.length > 0) {
+      const assistantMsg: ChatMessage = { role: 'assistant' };
+      if (assistantText) assistantMsg.content = assistantText;
+      if (toolCallsForHistory.length > 0) assistantMsg.tool_calls = toolCallsForHistory;
+      this.conversationHistory.push(assistantMsg);
+    }
+
+    // Cap history to prevent context overflow (keep last 20 turns)
+    if (this.conversationHistory.length > 40) {
+      this.conversationHistory = this.conversationHistory.slice(-40);
     }
 
     yield { type: 'done', usage };
+  }
+
+  /**
+   * Add a tool result to conversation history (for multi-turn tool use loops)
+   */
+  addToolResult(toolCallId: string, result: string): void {
+    this.conversationHistory.push({
+      role: 'tool',
+      tool_call_id: toolCallId,
+      content: result,
+    });
   }
 }
