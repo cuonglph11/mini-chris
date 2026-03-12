@@ -13,21 +13,22 @@ import { scanSkills, formatAvailableSkills } from '../skills/loader.js';
 import { injectSkill } from '../skills/runner.js';
 import { loadRegistry } from '../mcp/registry.js';
 import { ToolRouter } from '../mcp/tool-router.js';
+import { getCopilotSessionToken, COPILOT_HEADERS } from '../copilot-auth.js';
+import { proxyFetch } from '../net.js';
 import type { AppConfig, ToolDefinition } from '../types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let cachedModels: { id: string; label: string }[] | null = null;
+let cachedModelsAdapter: string | null = null;
 
 async function fetchCursorModels(binary: string): Promise<{ id: string; label: string }[]> {
-  if (cachedModels) return cachedModels;
+  if (cachedModels && cachedModelsAdapter === 'cursor') return cachedModels;
   try {
     const result = await execa(binary, ['agent', '--list-models'], { reject: false });
     const output = result.stdout || result.stderr || '';
-    // Strip ANSI escape codes
     const clean = output.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
     const lines = clean.split('\n').map(l => l.trim()).filter(Boolean);
-    // Parse lines like: "gpt-5.3-codex - GPT-5.3 Codex" or "auto - Auto  (current)"
     const models: { id: string; label: string }[] = [];
     for (const line of lines) {
       const match = line.match(/^([\w.-]+)\s+-\s+(.+)$/);
@@ -39,10 +40,43 @@ async function fetchCursorModels(binary: string): Promise<{ id: string; label: s
     }
     if (models.length > 0) {
       cachedModels = models;
+      cachedModelsAdapter = 'cursor';
       return cachedModels;
     }
   } catch { /* ignore */ }
   return [];
+}
+
+const COPILOT_FALLBACK_MODELS: { id: string; label: string }[] = [
+  { id: 'gpt-4o', label: 'GPT-4o' },
+  { id: 'gpt-4o-mini', label: 'GPT-4o Mini' },
+  { id: 'gpt-4', label: 'GPT-4' },
+  { id: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo' },
+  { id: 'o3-mini', label: 'O3 Mini' },
+  { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
+];
+
+async function fetchCopilotModels(config: AppConfig): Promise<{ id: string; label: string }[]> {
+  if (cachedModels && cachedModelsAdapter === 'copilot') return cachedModels;
+  try {
+    const token = await getCopilotSessionToken(config.copilot.auth, config.copilot.token);
+    const response = await proxyFetch('https://api.githubcopilot.com/models', {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json',
+        ...COPILOT_HEADERS,
+      },
+    });
+    if (!response.ok) throw new Error(`${response.status}`);
+    const data = await response.json() as { data?: Array<{ id: string; name?: string }> };
+    const list = data.data ?? (Array.isArray(data) ? data as Array<{ id: string; name?: string }> : []);
+    if (list.length > 0) {
+      cachedModels = list.map(m => ({ id: m.id, label: m.name || m.id }));
+      cachedModelsAdapter = 'copilot';
+      return cachedModels;
+    }
+  } catch { /* fall through */ }
+  return COPILOT_FALLBACK_MODELS;
 }
 
 
@@ -98,8 +132,14 @@ export async function startServer(port = 3000, configPath?: string): Promise<voi
 
   app.get('/api/models', async (_req, res) => {
     try {
-      const binary = config.cursor.binary ?? 'cursor';
-      const models = await fetchCursorModels(binary);
+      const adapterName = config.adapter;
+      let models: { id: string; label: string }[];
+      if (adapterName === 'copilot') {
+        models = await fetchCopilotModels(config);
+      } else {
+        const binary = config.cursor.binary ?? 'cursor';
+        models = await fetchCursorModels(binary);
+      }
       res.json({ models });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
