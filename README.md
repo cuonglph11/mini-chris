@@ -1,6 +1,6 @@
 # mini-chris
 
-A lightweight, open-source AI agent framework with persistent memory, sub-agent delegation, skill execution, and MCP tool integration. Bring your own LLM backend — works with **Cursor IDE** and **GitHub Copilot**.
+A lightweight, open-source AI agent framework built for **enterprise and corporate environments**. Uses your existing **Cursor IDE** or **GitHub Copilot** subscription as the LLM backend — no external API keys, no data leaving your network.
 
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)](https://www.typescriptlang.org/)
@@ -10,13 +10,16 @@ A lightweight, open-source AI agent framework with persistent memory, sub-agent 
 
 ## Why mini-chris?
 
-Most AI agent frameworks are heavyweight, opinionated, and vendor-locked. mini-chris is different:
+**Most AI agent frameworks require OpenAI/Anthropic API keys** — which means sending code and data to third-party services. That's a non-starter for most companies.
 
-- **Portable** — runs anywhere Node.js runs (macOS, Linux, Docker)
-- **Backend-agnostic** — swap between Cursor IDE and GitHub Copilot with a single config change
-- **Memory-first** — persistent workspace memory that survives across sessions
-- **Extensible** — add skills (Markdown), tools (MCP), or LLM backends without touching core code
-- **Lightweight** — minimal dependencies, fast startup, no daemons
+mini-chris is different: it piggybacks on tools your company **already pays for** (Cursor IDE or GitHub Copilot), keeping all LLM traffic within your existing vendor agreements and security policies.
+
+- **Enterprise-safe** — no extra API keys, no new vendor approvals, no data exfiltration risk
+- **Runs inside corporate networks** — works behind VPNs, proxies, and firewalls
+- **Uses existing subscriptions** — Cursor IDE or GitHub Copilot (most companies already have one)
+- **Zero data collection** — no telemetry, no analytics, all data stays local
+- **Fully self-hosted** — run on your machine, your server, or your Docker cluster
+- **Lightweight** — minimal dependencies, fast startup, no daemons or background services
 
 ## Features
 
@@ -367,14 +370,30 @@ src/
     └── public/index.html     # Single-page chat UI
 ```
 
-## Security
+## Security & Enterprise Compliance
 
-- No hardcoded secrets — uses environment variables and `${VAR}` expansion
+mini-chris is designed for corporate environments where data security matters:
+
+### No New Vendor Risk
+- **No OpenAI/Anthropic API keys required** — uses Cursor or Copilot, which your company already approved
+- All LLM traffic goes through your existing vendor (GitHub/Cursor) — no new data processors
+- No additional DPAs, security reviews, or procurement needed
+
+### Data Stays Local
+- **Zero telemetry** — no usage data, analytics, or phone-home
+- All memory, skills, and config stored in local `workspace/` directory
+- Git sync is opt-in and goes to **your** repository
 - API keys masked in REST responses (`apiKey: '***'`)
-- No telemetry, analytics, or external data collection
-- All data stored locally in `workspace/`
-- Git sync is opt-in (`mini-chris memory sync`)
-- Shell execution via `exec` tool — the LLM can run commands (same trust model as Cursor/Copilot agents)
+
+### Network Compatible
+- Works behind corporate VPNs, proxies, and firewalls
+- Proxy support via `HTTPS_PROXY` / `HTTP_PROXY` environment variables
+- Only outbound connections: `api.githubcopilot.com` (Copilot) or local Cursor CLI
+
+### Runtime Safety
+- No hardcoded secrets — uses environment variables and `${VAR}` config expansion
+- No daemon or persistent service — runs only when invoked
+- Shell execution via `exec` tool follows the same trust model as Cursor/Copilot agents
 
 > **Note:** The `exec` tool gives the LLM shell access. This is by design — mini-chris is a personal agent meant to run on your own machine. Do not expose the web UI to untrusted networks without additional access controls.
 
@@ -440,4 +459,4 @@ Contributions welcome! Please:
 
 ---
 
-**Built for developers who want a personal AI agent without the bloat.**
+**Built for developers who need a powerful AI agent that works inside corporate networks — no extra API keys, no data leaving your org.**
