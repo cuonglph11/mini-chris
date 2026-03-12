@@ -142,7 +142,9 @@ program
   .command('web')
   .description('Start web UI')
   .option('--port <port>', 'Port to listen on', '3000')
-  .action(async (opts: { port: string }) => {
+  .option('--adapter <adapter>', 'Adapter to use (cursor|copilot)')
+  .action(async (opts: { port: string; adapter?: string }) => {
+    if (opts.adapter) process.env.MINI_CHRIS_ADAPTER = opts.adapter;
     const { startServer } = await import('./web/server.js');
     await startServer(parseInt(opts.port, 10));
   });

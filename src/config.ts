@@ -23,7 +23,7 @@ function expandEnvVars(value: unknown): unknown {
 }
 
 const AppConfigSchema = z.object({
-  adapter: z.enum(['cursor', 'copilot']).default('cursor'),
+  adapter: z.enum(['cursor', 'copilot']).default(process.env.MINI_CHRIS_ADAPTER === 'copilot' ? 'copilot' : 'cursor'),
   model: z.string().default('auto'),
   cwd: z.string().default('.'),
   workspace: z.string().default('./workspace'),
