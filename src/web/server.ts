@@ -190,8 +190,9 @@ function formatConversationHistory(history: ChatTurn[]): string {
   return '\n## Conversation History\n' + lines.join('\n') + '\n';
 }
 
+const WS_MAX_TOOL_ROUNDS = 10;
+
 function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter) {
-  // Per-connection conversation history
   const history: ChatTurn[] = [];
 
   ws.on('message', async (raw) => {
@@ -212,9 +213,9 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
 
     const task = msg.content;
     const tools = router.getTools();
+    const mcpToolNames = new Set(tools.map(t => t.name));
 
     try {
-      // Build system prompt
       const [memoryContext, skillContext] = await Promise.all([
         injectWorkspaceContext(config.workspace),
         injectSkill(task, config.workspace),
@@ -223,11 +224,8 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
       const parts: string[] = ['You are mini-chris, a helpful AI assistant. Always consider the conversation history when answering follow-up questions.'];
       if (memoryContext) parts.push('\n## Workspace Context\n' + memoryContext);
       if (skillContext) parts.push('\n## Active Skill\n' + skillContext);
-
-      // Inject conversation history so the agent remembers prior turns
       const historyBlock = formatConversationHistory(history);
       if (historyBlock) parts.push(historyBlock);
-
       const systemPrompt = parts.join('\n');
 
       const effectiveConfig = msg.model ? { ...config, model: msg.model } : config;
@@ -235,48 +233,62 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
 
       let assistantText = '';
 
-      for await (const event of adapter.run({
-        systemPrompt,
-        task,
-        tools,
-        model: effectiveConfig.model,
-        cwd: effectiveConfig.cwd,
-        stream: true,
-      })) {
+      const processStream = async (stream: AsyncIterable<import('../types.js').AdapterEvent>): Promise<Array<{ id: string; name: string; args: Record<string, unknown> }>> => {
+        const pendingToolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> = [];
+        for await (const event of stream) {
+          if (ws.readyState !== WebSocket.OPEN) break;
+          switch (event.type) {
+            case 'text':
+              assistantText += event.content;
+              ws.send(JSON.stringify({ type: 'text', content: event.content }));
+              break;
+            case 'tool_call': {
+              ws.send(JSON.stringify({ type: 'tool_call', id: event.id, name: event.name, args: event.args }));
+              if (mcpToolNames.has(event.name)) {
+                pendingToolCalls.push({ id: event.id, name: event.name, args: event.args });
+              }
+              break;
+            }
+            case 'error':
+              ws.send(JSON.stringify({ type: 'error', message: event.message }));
+              break;
+            case 'done':
+              ws.send(JSON.stringify({ type: 'done', usage: event.usage }));
+              break;
+          }
+        }
+        return pendingToolCalls;
+      };
+
+      let pendingToolCalls = await processStream(adapter.run({
+        systemPrompt, task, tools, model: effectiveConfig.model, cwd: effectiveConfig.cwd, stream: true,
+      }));
+
+      let round = 0;
+      while (pendingToolCalls.length > 0 && adapter.addToolResult && adapter.continueAfterToolCall && round < WS_MAX_TOOL_ROUNDS) {
+        round++;
+        for (const tc of pendingToolCalls) {
+          try {
+            const result = await router.routeToolCall({ id: tc.id, name: tc.name, args: tc.args });
+            const resultStr = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+            ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: result.result, isError: result.isError }));
+            adapter.addToolResult(tc.id, resultStr);
+          } catch (e) {
+            const errMsg = (e as Error).message;
+            ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: errMsg, isError: true }));
+            adapter.addToolResult(tc.id, `Error: ${errMsg}`);
+          }
+        }
+
         if (ws.readyState !== WebSocket.OPEN) break;
 
-        switch (event.type) {
-          case 'text':
-            assistantText += event.content;
-            ws.send(JSON.stringify({ type: 'text', content: event.content }));
-            break;
-          case 'tool_call': {
-            ws.send(JSON.stringify({ type: 'tool_call', id: event.id, name: event.name, args: event.args }));
-            // Only route through MCP if it's a known MCP tool; Cursor handles its own built-in tools internally
-            const mcpToolNames = new Set(tools.map(t => t.name));
-            if (mcpToolNames.has(event.name)) {
-              try {
-                const result = await router.routeToolCall({ id: event.id, name: event.name, args: event.args });
-                ws.send(JSON.stringify({ type: 'tool_result', id: event.id, result: result.result, isError: result.isError }));
-              } catch (e) {
-                ws.send(JSON.stringify({ type: 'tool_result', id: event.id, result: (e as Error).message, isError: true }));
-              }
-            }
-            break;
-          }
-          case 'error':
-            ws.send(JSON.stringify({ type: 'error', message: event.message }));
-            break;
-          case 'done':
-            ws.send(JSON.stringify({ type: 'done', usage: event.usage }));
-            break;
-        }
+        pendingToolCalls = await processStream(adapter.continueAfterToolCall({
+          systemPrompt, tools, model: effectiveConfig.model, cwd: effectiveConfig.cwd,
+        }));
       }
 
-      // Save this turn to history (cap at 20 turns to avoid prompt overflow)
       history.push({ role: 'user', content: task });
       if (assistantText) {
-        // Truncate long responses in history to save context space
         const summary = assistantText.length > 500 ? assistantText.slice(0, 500) + '...' : assistantText;
         history.push({ role: 'assistant', content: summary });
       }

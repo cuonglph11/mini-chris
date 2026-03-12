@@ -36,6 +36,13 @@ export interface Adapter {
     cwd?: string;
     stream?: boolean;
   }): AsyncIterable<AdapterEvent>;
+  addToolResult?(toolCallId: string, result: string): void;
+  continueAfterToolCall?(options: {
+    systemPrompt: string;
+    tools: ToolDefinition[];
+    model?: string;
+    cwd?: string;
+  }): AsyncIterable<AdapterEvent>;
 }
 
 export interface SkillMeta {

@@ -6,7 +6,7 @@ import { injectWorkspaceContext } from './memory/inject.js';
 import { injectSkill } from './skills/runner.js';
 import { loadRegistry } from './mcp/registry.js';
 import { ToolRouter } from './mcp/tool-router.js';
-import type { AppConfig, ToolDefinition } from './types.js';
+import type { AdapterEvent, AppConfig, ToolDefinition } from './types.js';
 
 export interface RunOptions {
   adapter?: string;
@@ -50,6 +50,8 @@ async function buildSystemPrompt(task: string, config: AppConfig, history: ChatT
   return parts.join('\n');
 }
 
+const MAX_TOOL_ROUNDS = 10;
+
 async function runTurn(
   task: string,
   config: AppConfig,
@@ -60,53 +62,62 @@ async function runTurn(
   const systemPrompt = await buildSystemPrompt(task, config, history);
   let assistantText = '';
   const adapter = createAdapter(config.adapter, config);
+  const mcpToolNames = new Set(tools.map(t => t.name));
 
-  for await (const event of adapter.run({
-    systemPrompt,
-    task,
-    tools,
-    model: config.model,
-    cwd: config.cwd,
-    stream: true,
-  })) {
-    switch (event.type) {
-      case 'text':
-        assistantText += event.content;
-        process.stdout.write(event.content);
-        break;
-      case 'tool_call': {
-        process.stdout.write(
-          chalk.cyan(`\n[tool: ${event.name}] `) + chalk.dim(JSON.stringify(event.args)) + '\n',
-        );
-        // Only route through MCP if it's a known MCP tool; adapter built-in tools are handled internally
-        const mcpToolNames = new Set(tools.map(t => t.name));
-        if (mcpToolNames.has(event.name)) {
-          const result = await router.routeToolCall({
-            id: event.id,
-            name: event.name,
-            args: event.args,
-          });
-          const status = result.isError ? chalk.red('[error]') : chalk.green('[ok]');
-          process.stdout.write(chalk.cyan('[result] ') + status + '\n');
-        } else {
-          process.stdout.write(chalk.dim('[handled by adapter]\n'));
-        }
-        break;
-      }
-      case 'error':
-        process.stderr.write(chalk.red(`\nError: ${event.message}\n`));
-        break;
-      case 'done':
-        if (event.usage) {
-          process.stderr.write(
-            chalk.dim(
-              `\n[tokens: in=${event.usage.inputTokens} out=${event.usage.outputTokens}]\n`,
-            ),
+  const processStream = async (stream: AsyncIterable<AdapterEvent>): Promise<{ pendingToolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> }> => {
+    const pendingToolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }> = [];
+    for await (const event of stream) {
+      switch (event.type) {
+        case 'text':
+          assistantText += event.content;
+          process.stdout.write(event.content);
+          break;
+        case 'tool_call': {
+          process.stdout.write(
+            chalk.cyan(`\n[tool: ${event.name}] `) + chalk.dim(JSON.stringify(event.args)) + '\n',
           );
+          if (mcpToolNames.has(event.name)) {
+            pendingToolCalls.push({ id: event.id, name: event.name, args: event.args });
+          } else {
+            process.stdout.write(chalk.dim('[handled by adapter]\n'));
+          }
+          break;
         }
-        break;
+        case 'error':
+          process.stderr.write(chalk.red(`\nError: ${event.message}\n`));
+          break;
+        case 'done':
+          if (event.usage) {
+            process.stderr.write(
+              chalk.dim(`\n[tokens: in=${event.usage.inputTokens} out=${event.usage.outputTokens}]\n`),
+            );
+          }
+          break;
+      }
     }
+    return { pendingToolCalls };
+  };
+
+  let { pendingToolCalls } = await processStream(adapter.run({
+    systemPrompt, task, tools, model: config.model, cwd: config.cwd, stream: true,
+  }));
+
+  let round = 0;
+  while (pendingToolCalls.length > 0 && adapter.addToolResult && adapter.continueAfterToolCall && round < MAX_TOOL_ROUNDS) {
+    round++;
+    for (const tc of pendingToolCalls) {
+      const result = await router.routeToolCall({ id: tc.id, name: tc.name, args: tc.args });
+      const status = result.isError ? chalk.red('[error]') : chalk.green('[ok]');
+      process.stdout.write(chalk.cyan('[result] ') + status + '\n');
+      const resultStr = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+      adapter.addToolResult(tc.id, resultStr);
+    }
+
+    ({ pendingToolCalls } = await processStream(adapter.continueAfterToolCall({
+      systemPrompt, tools, model: config.model, cwd: config.cwd,
+    })));
   }
+
   return assistantText;
 }
 
