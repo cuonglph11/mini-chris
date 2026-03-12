@@ -1,0 +1,18 @@
+adapter: cursor                    # cursor | copilot
+model: auto                        # model name or "auto"
+cwd: .                             # default working directory
+workspace: ./workspace             # path to workspace dir
+
+# Embedding for memory search
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  apiKey: ${OPENAI_API_KEY}        # env var reference
+
+# Adapter-specific
+cursor:
+  binary: cursor                   # path to cursor binary (optional)
+
+copilot:
+  auth: gh                         # "gh" (use gh CLI auth) or "token"
+  # token: ${GITHUB_TOKEN}         # only if auth=token
