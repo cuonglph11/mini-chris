@@ -32,10 +32,12 @@ interface ChatMessage {
 export class CopilotAdapter implements Adapter {
   name = 'copilot';
   private conversationHistory: ChatMessage[] = [];
+  private cachedCopilotToken: { token: string; expiresAt: number } | null = null;
 
   constructor(private config: AppConfig) {}
 
-  private async getToken(): Promise<string> {
+  /** Get the GitHub PAT (used to exchange for a Copilot token) */
+  private async getGitHubToken(): Promise<string> {
     // 1. Direct token from config
     if (this.config.copilot.auth === 'token') {
       const token = this.config.copilot.token;
@@ -59,6 +61,46 @@ export class CopilotAdapter implements Adapter {
     return (result.stdout as string).trim();
   }
 
+  /** Exchange GitHub PAT for a short-lived Copilot API token */
+  private async getCopilotToken(): Promise<string> {
+    // Return cached token if still valid (with 60s buffer)
+    if (this.cachedCopilotToken && Date.now() / 1000 < this.cachedCopilotToken.expiresAt - 60) {
+      return this.cachedCopilotToken.token;
+    }
+
+    const githubToken = await this.getGitHubToken();
+
+    let response: Response;
+    try {
+      response = await fetch('https://api.github.com/copilot_internal/v2/token', {
+        headers: {
+          'Authorization': `token ${githubToken}`,
+          'Accept': 'application/json',
+          ...HEADERS_COMPAT,
+        },
+      });
+    } catch (err) {
+      const cause = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Failed to reach GitHub API for Copilot token exchange: ${cause}. ` +
+        'Check your network connection and ensure api.github.com is accessible.',
+        { cause: err instanceof Error ? err : undefined },
+      );
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      throw new Error(
+        `Failed to get Copilot token (${response.status}): ${text}. ` +
+        'Ensure your GitHub account has an active Copilot subscription and your PAT has the "copilot" scope.',
+      );
+    }
+
+    const data = await response.json() as { token: string; expires_at: number };
+    this.cachedCopilotToken = { token: data.token, expiresAt: data.expires_at };
+    return data.token;
+  }
+
   resetHistory(): void {
     this.conversationHistory = [];
   }
@@ -73,10 +115,13 @@ export class CopilotAdapter implements Adapter {
   }): AsyncIterable<AdapterEvent> {
     let token: string;
     try {
-      token = await this.getToken();
+      token = await this.getCopilotToken();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      yield { type: 'error', message };
+      const cause = err instanceof Error && err.cause
+        ? ` (${err.cause instanceof Error ? err.cause.message : String(err.cause)})`
+        : '';
+      yield { type: 'error', message: `Copilot auth failed: ${message}${cause}` };
       yield { type: 'done' };
       return;
     }
@@ -128,7 +173,10 @@ export class CopilotAdapter implements Adapter {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      yield { type: 'error', message: `Network error: ${message}` };
+      const cause = err instanceof Error && err.cause
+        ? ` (${err.cause instanceof Error ? err.cause.message : String(err.cause)})`
+        : '';
+      yield { type: 'error', message: `Network error: ${message}${cause}` };
       yield { type: 'done' };
       return;
     }
