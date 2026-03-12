@@ -1,6 +1,7 @@
 import { execa } from 'execa';
 import { createParser } from 'eventsource-parser';
 import { type Adapter, type AdapterEvent, type AppConfig, type ToolDefinition } from '../types.js';
+import { proxyFetch, formatFetchError } from '../net.js';
 
 const COPILOT_API_URL = 'https://api.githubcopilot.com/chat/completions';
 
@@ -72,7 +73,7 @@ export class CopilotAdapter implements Adapter {
 
     let response: Response;
     try {
-      response = await fetch('https://api.github.com/copilot_internal/v2/token', {
+      response = await proxyFetch('https://api.github.com/copilot_internal/v2/token', {
         headers: {
           'Authorization': `token ${githubToken}`,
           'Accept': 'application/json',
@@ -80,10 +81,8 @@ export class CopilotAdapter implements Adapter {
         },
       });
     } catch (err) {
-      const cause = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `Failed to reach GitHub API for Copilot token exchange: ${cause}. ` +
-        'Check your network connection and ensure api.github.com is accessible.',
+        `Failed to reach GitHub API for Copilot token exchange: ${formatFetchError(err)}`,
         { cause: err instanceof Error ? err : undefined },
       );
     }
@@ -117,11 +116,7 @@ export class CopilotAdapter implements Adapter {
     try {
       token = await this.getCopilotToken();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const cause = err instanceof Error && err.cause
-        ? ` (${err.cause instanceof Error ? err.cause.message : String(err.cause)})`
-        : '';
-      yield { type: 'error', message: `Copilot auth failed: ${message}${cause}` };
+      yield { type: 'error', message: `Copilot auth failed: ${formatFetchError(err)}` };
       yield { type: 'done' };
       return;
     }
@@ -162,7 +157,7 @@ export class CopilotAdapter implements Adapter {
 
     let response: Response;
     try {
-      response = await fetch(COPILOT_API_URL, {
+      response = await proxyFetch(COPILOT_API_URL, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -172,11 +167,7 @@ export class CopilotAdapter implements Adapter {
         body: JSON.stringify(body),
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const cause = err instanceof Error && err.cause
-        ? ` (${err.cause instanceof Error ? err.cause.message : String(err.cause)})`
-        : '';
-      yield { type: 'error', message: `Network error: ${message}${cause}` };
+      yield { type: 'error', message: `Network error: ${formatFetchError(err)}` };
       yield { type: 'done' };
       return;
     }
