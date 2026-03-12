@@ -41,7 +41,7 @@ const AppConfigSchema = z.object({
     .default({}),
   copilot: z
     .object({
-      auth: z.enum(['gh', 'token']).default('gh'),
+      auth: z.enum(['gh', 'token', 'device']).default('device'),
       token: z.string().optional(),
     })
     .default({}),

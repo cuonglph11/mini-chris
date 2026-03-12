@@ -1,17 +1,9 @@
-import { execa } from 'execa';
 import { createParser } from 'eventsource-parser';
 import { type Adapter, type AdapterEvent, type AppConfig, type ToolDefinition } from '../types.js';
 import { proxyFetch, formatFetchError } from '../net.js';
+import { getCopilotSessionToken, COPILOT_HEADERS } from '../copilot-auth.js';
 
 const COPILOT_API_URL = 'https://api.githubcopilot.com/chat/completions';
-
-// Use VS Code-like headers to avoid enterprise 421 errors
-const HEADERS_COMPAT = {
-  'User-Agent': 'GitHubCopilotChat/0.35.0',
-  'Editor-Version': 'vscode/1.107.0',
-  'Editor-Plugin-Version': 'copilot-chat/0.35.0',
-  'Copilot-Integration-Id': 'vscode-chat',
-};
 
 interface ToolCallAccumulator {
   id: string;
@@ -33,71 +25,11 @@ interface ChatMessage {
 export class CopilotAdapter implements Adapter {
   name = 'copilot';
   private conversationHistory: ChatMessage[] = [];
-  private cachedCopilotToken: { token: string; expiresAt: number } | null = null;
 
   constructor(private config: AppConfig) {}
 
-  /** Get the GitHub PAT (used to exchange for a Copilot token) */
-  private async getGitHubToken(): Promise<string> {
-    // 1. Direct token from config
-    if (this.config.copilot.auth === 'token') {
-      const token = this.config.copilot.token;
-      if (!token) throw new Error('copilot.token is required when auth is "token"');
-      return token;
-    }
-
-    // 2. Environment variable fallback chain
-    for (const envVar of ['COPILOT_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
-      const val = process.env[envVar];
-      if (val) return val;
-    }
-
-    // 3. gh CLI auth
-    const result = await execa('gh', ['auth', 'token'], { reject: false });
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `Failed to get GitHub token. Set GITHUB_TOKEN env var or run 'gh auth login'. Error: ${result.stderr}`,
-      );
-    }
-    return (result.stdout as string).trim();
-  }
-
-  /** Exchange GitHub PAT for a short-lived Copilot API token */
   private async getCopilotToken(): Promise<string> {
-    // Return cached token if still valid (with 60s buffer)
-    if (this.cachedCopilotToken && Date.now() / 1000 < this.cachedCopilotToken.expiresAt - 60) {
-      return this.cachedCopilotToken.token;
-    }
-
-    const githubToken = await this.getGitHubToken();
-
-    let response: Response;
-    try {
-      response = await proxyFetch('https://api.github.com/copilot_internal/v2/token', {
-        headers: {
-          'Authorization': `token ${githubToken}`,
-          'Accept': 'application/json',
-          ...HEADERS_COMPAT,
-        },
-      });
-    } catch (err) {
-      throw new Error(
-        `Failed to reach GitHub API for Copilot token exchange: ${formatFetchError(err)}`,
-        { cause: err instanceof Error ? err : undefined },
-      );
-    }
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      throw new Error(
-        `Failed to get Copilot token (${response.status}): ${text}. ` +
-        'Ensure your GitHub account has an active Copilot subscription and your PAT has the "copilot" scope.',
-      );
-    }
-
-    const data = await response.json() as { token: string; expires_at: number };
-    this.cachedCopilotToken = { token: data.token, expiresAt: data.expires_at };
-    return data.token;
+    return getCopilotSessionToken(this.config.copilot.auth, this.config.copilot.token);
   }
 
   resetHistory(): void {
@@ -162,7 +94,7 @@ export class CopilotAdapter implements Adapter {
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
-          ...HEADERS_COMPAT,
+          ...COPILOT_HEADERS,
         },
         body: JSON.stringify(body),
       });

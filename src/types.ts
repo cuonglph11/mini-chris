@@ -74,7 +74,7 @@ export interface AppConfig {
     binary?: string;
   };
   copilot: {
-    auth: 'gh' | 'token';
+    auth: 'gh' | 'token' | 'device';
     token?: string;
   };
 }

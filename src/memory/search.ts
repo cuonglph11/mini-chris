@@ -2,9 +2,9 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { glob } from 'glob';
 import OpenAI from 'openai';
-import { execa } from 'execa';
 import type { MemorySearchResult } from '../types.js';
 import { proxyFetch } from '../net.js';
+import { getCopilotSessionToken, COPILOT_HEADERS } from '../copilot-auth.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -92,43 +92,10 @@ function createOpenAIEmbed(apiKey: string, model: string): EmbedFn {
   };
 }
 
-const COPILOT_HEADERS = {
-  'User-Agent': 'GitHubCopilotChat/0.35.0',
-  'Editor-Version': 'vscode/1.107.0',
-  'Editor-Plugin-Version': 'copilot-chat/0.35.0',
-  'Copilot-Integration-Id': 'vscode-chat',
-};
-
-async function getGitHubPAT(): Promise<string> {
-  for (const envVar of ['COPILOT_GITHUB_TOKEN', 'GITHUB_TOKEN', 'GH_TOKEN']) {
-    const val = process.env[envVar];
-    if (val) return val;
-  }
-  const result = await execa('gh', ['auth', 'token'], { reject: false });
-  if (result.exitCode === 0 && result.stdout) return result.stdout.trim();
-  throw new Error('No GitHub token available. Set GITHUB_TOKEN or run `gh auth login`.');
-}
-
-async function exchangeCopilotToken(pat: string): Promise<string> {
-  const response = await proxyFetch('https://api.github.com/copilot_internal/v2/token', {
-    headers: {
-      'Authorization': `token ${pat}`,
-      'Accept': 'application/json',
-      ...COPILOT_HEADERS,
-    },
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Copilot token exchange failed (${response.status}): ${text}`);
-  }
-  const data = await response.json() as { token: string; expires_at: number };
-  return data.token;
-}
-
 function createCopilotEmbed(): EmbedFn {
   let tokenPromise: Promise<string> | null = null;
   return async (text: string) => {
-    if (!tokenPromise) tokenPromise = getGitHubPAT().then(exchangeCopilotToken);
+    if (!tokenPromise) tokenPromise = getCopilotSessionToken('device');
     const token = await tokenPromise;
 
     const response = await proxyFetch('https://api.githubcopilot.com/embeddings', {
