@@ -134,7 +134,7 @@ function createCopilotEmbed(): EmbedFn {
 
 // ── Ollama embeddings (fallback 3: local, no API key) ────────────────────────
 
-const OLLAMA_MODELS = ['nomic-embed-text', 'all-minilm', 'mxbai-embed-large'];
+const OLLAMA_MODELS = ['gte-large-en-v1.5', 'nomic-embed-text', 'all-minilm', 'mxbai-embed-large'];
 
 function createOllamaEmbed(): EmbedFn {
   const baseUrl = process.env.OLLAMA_HOST || 'http://localhost:11434';
