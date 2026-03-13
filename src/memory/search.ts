@@ -1,6 +1,8 @@
 import { readFile } from 'fs/promises';
 import { join } from 'path';
+import { createHash } from 'crypto';
 import { glob } from 'glob';
+import { LocalIndex } from 'vectra';
 import OpenAI from 'openai';
 import type { MemorySearchResult } from '../types.js';
 import { proxyFetch } from '../net.js';
@@ -13,18 +15,25 @@ export interface MemoryChunk {
   lineStart: number;
   lineEnd: number;
   content: string;
-  embedding?: number[];
+  hash: string;
 }
 
 export interface MemoryIndex {
+  vectraIndex: LocalIndex | null;
   chunks: MemoryChunk[];
-  embeddingCache: Map<string, number[]>;
+  provider: 'openai' | 'copilot' | 'ollama' | 'keyword';
+  embedFn: EmbedFn | null;
   apiKey: string;
   model: string;
-  provider: 'openai' | 'copilot' | 'ollama' | 'keyword';
 }
 
 type EmbedFn = (text: string) => Promise<number[]>;
+
+// ── Hashing ──────────────────────────────────────────────────────────────────
+
+function contentHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex').slice(0, 16);
+}
 
 // ── Chunking ─────────────────────────────────────────────────────────────────
 
@@ -40,11 +49,13 @@ function splitIntoChunks(text: string, filePath: string, chunkSize = 500): Memor
 
     if (currentChunk.length + paragraph.length > chunkSize && currentChunk.length > 0) {
       const endLine = lineNumber - 1;
+      const content = currentChunk.trim();
       chunks.push({
         filePath,
         lineStart: chunkStart,
         lineEnd: endLine,
-        content: currentChunk.trim(),
+        content,
+        hash: contentHash(content),
       });
       chunkStart = lineNumber;
       currentChunk = paragraph + '\n\n';
@@ -56,30 +67,17 @@ function splitIntoChunks(text: string, filePath: string, chunkSize = 500): Memor
   }
 
   if (currentChunk.trim().length > 0) {
+    const content = currentChunk.trim();
     chunks.push({
       filePath,
       lineStart: chunkStart,
       lineEnd: lineNumber - 1,
-      content: currentChunk.trim(),
+      content,
+      hash: contentHash(content),
     });
   }
 
   return chunks;
-}
-
-// ── Cosine similarity ────────────────────────────────────────────────────────
-
-export function cosineSimilarity(a: number[], b: number[]): number {
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  return denom === 0 ? 0 : dot / denom;
 }
 
 // ── Embedding providers ──────────────────────────────────────────────────────
@@ -94,7 +92,6 @@ function createOpenAIEmbed(apiKey: string, model: string): EmbedFn {
 
 function createCopilotEmbed(): EmbedFn {
   let tokenPromise: Promise<string> | null = null;
-  // Copilot supports these embedding models — try in order
   const MODELS = ['copilot-text-embedding-ada-002', 'text-embedding-ada-002', 'text-embedding-3-small'];
 
   return async (text: string) => {
@@ -151,7 +148,6 @@ function createOllamaEmbed(): EmbedFn {
 
         if (response.ok) {
           const data = await response.json() as { embeddings?: number[][]; embedding?: number[] };
-          // Ollama returns { embeddings: [[...]] } in newer versions, { embedding: [...] } in older
           const embedding = data.embeddings?.[0] ?? data.embedding;
           if (embedding && embedding.length > 0) return embedding;
         }
@@ -186,7 +182,6 @@ function keywordScore(query: string, content: string): number {
     if (contentTokens.has(token)) {
       matches++;
     } else {
-      // Partial match: check if any content token contains the query token
       for (const ct of contentTokens) {
         if (ct.includes(token) || token.includes(ct)) {
           matches += 0.5;
@@ -196,7 +191,6 @@ function keywordScore(query: string, content: string): number {
     }
   }
 
-  // Normalize by query length, boost shorter content (more focused)
   const relevance = matches / queryTokens.length;
   const brevityBonus = Math.min(1, 200 / Math.max(content.length, 1));
   return relevance * 0.8 + relevance * brevityBonus * 0.2;
@@ -225,6 +219,49 @@ async function loadChunks(workspacePath: string): Promise<MemoryChunk[]> {
   return allChunks;
 }
 
+// ── Vectra index sync ────────────────────────────────────────────────────────
+
+async function syncVectraIndex(
+  vectraIndex: LocalIndex,
+  chunks: MemoryChunk[],
+  embed: EmbedFn,
+): Promise<{ added: number; removed: number }> {
+  // Get existing items from Vectra
+  const existingItems = await vectraIndex.listItems();
+  const existingByHash = new Map<string, string>(); // hash → id
+  for (const item of existingItems) {
+    const hash = item.metadata.hash as string;
+    if (hash) existingByHash.set(hash, item.id);
+  }
+
+  // Determine what's new and what's stale
+  const currentHashes = new Set(chunks.map(c => c.hash));
+  const toAdd = chunks.filter(c => !existingByHash.has(c.hash));
+  const toRemove = [...existingByHash.entries()].filter(([hash]) => !currentHashes.has(hash));
+
+  // Remove stale items
+  for (const [, id] of toRemove) {
+    await vectraIndex.deleteItem(id);
+  }
+
+  // Add new items
+  for (const chunk of toAdd) {
+    const vector = await embed(chunk.content);
+    await vectraIndex.insertItem({
+      vector,
+      metadata: {
+        content: chunk.content,
+        filePath: chunk.filePath,
+        lineStart: chunk.lineStart,
+        lineEnd: chunk.lineEnd,
+        hash: chunk.hash,
+      },
+    });
+  }
+
+  return { added: toAdd.length, removed: toRemove.length };
+}
+
 // ── Build index with fallback chain ──────────────────────────────────────────
 
 export async function buildIndex(
@@ -233,10 +270,16 @@ export async function buildIndex(
   model = 'text-embedding-3-small'
 ): Promise<MemoryIndex> {
   const allChunks = await loadChunks(workspacePath);
-  const embeddingCache = new Map<string, number[]>();
 
   if (allChunks.length === 0) {
-    return { chunks: allChunks, embeddingCache, apiKey, model, provider: 'keyword' };
+    return { vectraIndex: null, chunks: allChunks, provider: 'keyword', embedFn: null, apiKey, model };
+  }
+
+  // Initialize Vectra local index
+  const indexPath = join(workspacePath, '.vectra');
+  const vectraIndex = new LocalIndex(indexPath);
+  if (!await vectraIndex.isIndexCreated()) {
+    await vectraIndex.createIndex();
   }
 
   // Try embedding providers in order: OpenAI → Copilot → Ollama → Keyword
@@ -255,21 +298,11 @@ export async function buildIndex(
       const testEmbedding = await embed(allChunks[0].content.slice(0, 100));
       if (!testEmbedding || testEmbedding.length === 0) throw new Error('Empty embedding');
 
-      // Provider works — embed all chunks
-      embeddingCache.set(allChunks[0].content, testEmbedding);
-      allChunks[0].embedding = testEmbedding;
+      // Provider works — sync Vectra index (only embed new/changed chunks)
+      const { added, removed } = await syncVectraIndex(vectraIndex, allChunks, embed);
 
-      for (let i = 1; i < allChunks.length; i++) {
-        const chunk = allChunks[i];
-        if (!embeddingCache.has(chunk.content)) {
-          const embedding = await embed(chunk.content);
-          embeddingCache.set(chunk.content, embedding);
-        }
-        chunk.embedding = embeddingCache.get(chunk.content);
-      }
-
-      console.error(`[memory] Using ${name} embeddings (${allChunks.length} chunks indexed)`);
-      return { chunks: allChunks, embeddingCache, apiKey, model, provider: name };
+      console.error(`[memory] Using ${name} embeddings via Vectra (${allChunks.length} chunks, +${added}/-${removed} synced)`);
+      return { vectraIndex, chunks: allChunks, provider: name, embedFn: embed, apiKey, model };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[memory] ${name} embeddings failed: ${msg}, trying next...`);
@@ -278,10 +311,10 @@ export async function buildIndex(
 
   // All embedding providers failed — fall back to keyword search
   console.error(`[memory] Using keyword search fallback (${allChunks.length} chunks)`);
-  return { chunks: allChunks, embeddingCache, apiKey, model, provider: 'keyword' };
+  return { vectraIndex: null, chunks: allChunks, provider: 'keyword', embedFn: null, apiKey, model };
 }
 
-// ── Search with fallback ─────────────────────────────────────────────────────
+// ── Search ───────────────────────────────────────────────────────────────────
 
 export async function searchMemory(
   query: string,
@@ -290,44 +323,23 @@ export async function searchMemory(
   topN = 5
 ): Promise<MemorySearchResult[]> {
 
-  if (index.provider === 'keyword' || index.chunks.every(c => !c.embedding)) {
-    // Keyword fallback
+  if (index.provider === 'keyword' || !index.vectraIndex || !index.embedFn) {
     return keywordSearch(query, index.chunks, topN);
   }
 
-  // Embedding search — use same provider that built the index
   try {
-    let embed: EmbedFn;
-    if (index.provider === 'openai' && apiKey) {
-      embed = createOpenAIEmbed(apiKey, index.model);
-    } else if (index.provider === 'copilot') {
-      embed = createCopilotEmbed();
-    } else if (index.provider === 'ollama') {
-      embed = createOllamaEmbed();
-    } else {
-      return keywordSearch(query, index.chunks, topN);
-    }
+    const queryVector = await index.embedFn(query);
+    const results = await index.vectraIndex.queryItems(queryVector, query, topN);
 
-    const queryEmbedding = await embed(query);
-
-    const scored = index.chunks
-      .filter((chunk) => chunk.embedding !== undefined)
-      .map((chunk) => ({
-        chunk,
-        score: cosineSimilarity(queryEmbedding, chunk.embedding!),
-      }));
-
-    scored.sort((a, b) => b.score - a.score);
-
-    return scored.slice(0, topN).map(({ chunk, score }) => ({
-      content: chunk.content,
-      filePath: chunk.filePath,
-      lineStart: chunk.lineStart,
-      lineEnd: chunk.lineEnd,
-      score,
+    return results.map(r => ({
+      content: r.item.metadata.content as string,
+      filePath: r.item.metadata.filePath as string,
+      lineStart: r.item.metadata.lineStart as number,
+      lineEnd: r.item.metadata.lineEnd as number,
+      score: r.score,
     }));
   } catch {
-    // If embedding search fails at query time, fall back to keyword
+    // If vector search fails at query time, fall back to keyword
     return keywordSearch(query, index.chunks, topN);
   }
 }
