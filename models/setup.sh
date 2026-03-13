@@ -11,8 +11,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GGUF_FILE="$SCRIPT_DIR/all-MiniLM-L6-v2.Q4_K_M.gguf"
-MODEL_NAME="all-minilm"
+GGUF_FILE="$SCRIPT_DIR/nomic-embed-text-v1.5.Q4_K_M.gguf"
+MODEL_NAME="nomic-embed-text"
 
 # Check ollama is installed
 if ! command -v ollama &>/dev/null; then
@@ -26,8 +26,8 @@ if [ ! -f "$GGUF_FILE" ]; then
   echo "Error: GGUF file not found at $GGUF_FILE"
   echo ""
   echo "Download it manually and place it in this directory:"
-  echo "  File: all-MiniLM-L6-v2.Q4_K_M.gguf (~23MB)"
-  echo "  From: https://huggingface.co/leliuga/all-MiniLM-L6-v2-GGUF/resolve/main/all-MiniLM-L6-v2.Q4_K_M.gguf"
+  echo "  File: nomic-embed-text-v1.5.Q4_K_M.gguf (~80MB)"
+  echo "  From: https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf"
   echo ""
   echo "Or copy from a colleague who already has it."
   exit 1

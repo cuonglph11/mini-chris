@@ -1,1 +1,1 @@
-FROM ./all-MiniLM-L6-v2.Q4_K_M.gguf
+FROM ./nomic-embed-text-v1.5.Q4_K_M.gguf
