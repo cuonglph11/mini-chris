@@ -1,9 +1,11 @@
 import { buildIndex, searchMemory as searchMemoryRaw } from './search.js';
+import type { EmbeddingConfig } from './search.js';
 import type { MemorySearchResult } from '../types.js';
 
 export { injectWorkspaceContext } from './inject.js';
 export { appendToMemory, appendToDailyLog, syncMemory } from './persist.js';
 export { buildIndex } from './search.js';
+export type { EmbeddingConfig } from './search.js';
 export {
   DEFAULT_FLUSH_CONFIG,
   shouldFlushMemory,
@@ -20,7 +22,8 @@ export async function searchMemory(
   workspace: string,
   apiKey: string,
   embeddingModel?: string,
+  embeddingConfig?: EmbeddingConfig,
 ): Promise<MemorySearchResult[]> {
-  const index = await buildIndex(workspace, apiKey, embeddingModel);
+  const index = await buildIndex(workspace, apiKey, embeddingModel, embeddingConfig);
   return searchMemoryRaw(query, index, apiKey);
 }

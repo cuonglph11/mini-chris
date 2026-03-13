@@ -154,7 +154,7 @@ export async function startServer(port = 3000, configPath?: string): Promise<voi
     try {
       const { query } = req.body as { query: string };
       if (!query) return res.status(400).json({ error: 'query required' });
-      const index = await buildIndex(config.workspace, config.embedding.apiKey, config.embedding.model);
+      const index = await buildIndex(config.workspace, config.embedding.apiKey, config.embedding.model, config.embedding);
       const results = await searchMemory(query, index, config.embedding.apiKey);
       res.json({ results });
     } catch (e) {
@@ -288,7 +288,7 @@ function handleWsConnection(ws: WebSocket, config: AppConfig, router: ToolRouter
               ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: '[sub-agent completed]', isError: false }));
               adapter.addToolResult(tc.id, subResult);
             } else if (tc.name === 'memory_search') {
-              const resultStr = await executeMemorySearch(tc.args, config.workspace, config.embedding.apiKey, config.embedding.model);
+              const resultStr = await executeMemorySearch(tc.args, config.workspace, config.embedding.apiKey, config.embedding.model, config.embedding);
               ws.send(JSON.stringify({ type: 'tool_result', id: tc.id, result: JSON.parse(resultStr), isError: false }));
               adapter.addToolResult(tc.id, resultStr);
             } else if (tc.name === 'memory_save') {

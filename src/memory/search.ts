@@ -29,6 +29,15 @@ export interface MemoryIndex {
 
 type EmbedFn = (text: string) => Promise<number[]>;
 
+export interface EmbeddingConfig {
+  provider?: string;
+  model?: string;
+  apiKey?: string;
+  providerOrder?: string[];
+  ollamaHost?: string;
+  vectraPath?: string;
+}
+
 // ── Hashing ──────────────────────────────────────────────────────────────────
 
 function contentHash(content: string): string {
@@ -133,8 +142,8 @@ function createCopilotEmbed(): EmbedFn {
 
 const OLLAMA_MODELS = ['nomic-embed-text', 'gte-large-en-v1.5', 'all-minilm', 'mxbai-embed-large'];
 
-function createOllamaEmbed(): EmbedFn {
-  const baseUrl = process.env.OLLAMA_HOST || 'http://localhost:11434';
+function createOllamaEmbed(host?: string): EmbedFn {
+  const baseUrl = host || process.env.OLLAMA_HOST || 'http://localhost:11434';
 
   return async (text: string) => {
     let lastError = '';
@@ -264,54 +273,65 @@ async function syncVectraIndex(
 
 // ── Build index with fallback chain ──────────────────────────────────────────
 
+const DEFAULT_PROVIDER_ORDER = ['ollama', 'copilot', 'openai', 'keyword'];
+
 export async function buildIndex(
   workspacePath: string,
   apiKey: string,
-  model = 'text-embedding-3-small'
+  model = 'text-embedding-3-small',
+  embeddingConfig?: EmbeddingConfig,
 ): Promise<MemoryIndex> {
+  const cfg = embeddingConfig ?? {};
+  const effectiveApiKey = cfg.apiKey || apiKey;
+  const effectiveModel = cfg.model || model;
+  const providerOrder = cfg.providerOrder ?? DEFAULT_PROVIDER_ORDER;
+
   const allChunks = await loadChunks(workspacePath);
 
   if (allChunks.length === 0) {
-    return { vectraIndex: null, chunks: allChunks, provider: 'keyword', embedFn: null, apiKey, model };
+    return { vectraIndex: null, chunks: allChunks, provider: 'keyword', embedFn: null, apiKey: effectiveApiKey, model: effectiveModel };
   }
 
-  // Initialize Vectra local index
-  const indexPath = join(workspacePath, '.vectra');
+  // Initialize Vectra local index (configurable path)
+  const indexPath = cfg.vectraPath || join(workspacePath, '.vectra');
   const vectraIndex = new LocalIndex(indexPath);
   if (!await vectraIndex.isIndexCreated()) {
     await vectraIndex.createIndex();
   }
 
-  // Try embedding providers in order: OpenAI → Copilot → Ollama → Keyword
-  const providers: Array<{ name: 'openai' | 'copilot' | 'ollama'; create: () => EmbedFn }> = [];
+  // Build provider factory map
+  const providerFactory: Record<string, { name: 'openai' | 'copilot' | 'ollama'; create: () => EmbedFn }> = {
+    ollama: { name: 'ollama', create: () => createOllamaEmbed(cfg.ollamaHost) },
+    copilot: { name: 'copilot', create: () => createCopilotEmbed() },
+    openai: { name: 'openai', create: () => createOpenAIEmbed(effectiveApiKey, effectiveModel) },
+  };
 
-  if (apiKey) {
-    providers.push({ name: 'openai', create: () => createOpenAIEmbed(apiKey, model) });
-  }
-  providers.push({ name: 'copilot', create: () => createCopilotEmbed() });
-  providers.push({ name: 'ollama', create: () => createOllamaEmbed() });
+  // Try providers in configured order (skip openai if no key)
+  for (const providerName of providerOrder) {
+    if (providerName === 'keyword') break; // keyword is the final fallback
+    const factory = providerFactory[providerName];
+    if (!factory) continue;
+    if (providerName === 'openai' && !effectiveApiKey) continue;
 
-  for (const { name, create } of providers) {
     try {
-      const embed = create();
-      // Test with first chunk to verify the provider works
+      const embed = factory.create();
       const testEmbedding = await embed(allChunks[0].content.slice(0, 100));
       if (!testEmbedding || testEmbedding.length === 0) throw new Error('Empty embedding');
 
       // Provider works — sync Vectra index (only embed new/changed chunks)
       const { added, removed } = await syncVectraIndex(vectraIndex, allChunks, embed);
 
-      console.error(`[memory] Using ${name} embeddings via Vectra (${allChunks.length} chunks, +${added}/-${removed} synced)`);
-      return { vectraIndex, chunks: allChunks, provider: name, embedFn: embed, apiKey, model };
+      console.error(`[memory] Using ${factory.name} embeddings via Vectra (${allChunks.length} chunks, +${added}/-${removed} synced)`);
+      return { vectraIndex, chunks: allChunks, provider: factory.name, embedFn: embed, apiKey: effectiveApiKey, model: effectiveModel };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[memory] ${name} embeddings failed: ${msg}, trying next...`);
+      console.error(`[memory] ${factory.name} embeddings failed: ${msg}, trying next...`);
     }
   }
 
   // All embedding providers failed — fall back to keyword search
   console.error(`[memory] Using keyword search fallback (${allChunks.length} chunks)`);
-  return { vectraIndex: null, chunks: allChunks, provider: 'keyword', embedFn: null, apiKey, model };
+  return { vectraIndex: null, chunks: allChunks, provider: 'keyword', embedFn: null, apiKey: effectiveApiKey, model: effectiveModel };
 }
 
 // ── Search ───────────────────────────────────────────────────────────────────

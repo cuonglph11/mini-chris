@@ -132,7 +132,7 @@ async function runTurn(
           process.stdout.write(chalk.red(`[sub-agent error: ${errMsg}]\n`));
         }
       } else if (tc.name === 'memory_search') {
-        resultStr = await executeMemorySearch(tc.args, config.workspace, config.embedding.apiKey, config.embedding.model);
+        resultStr = await executeMemorySearch(tc.args, config.workspace, config.embedding.apiKey, config.embedding.model, config.embedding);
         process.stdout.write(chalk.cyan('[result] ') + chalk.green('[ok]') + '\n');
       } else if (tc.name === 'memory_save') {
         resultStr = await executeMemorySave(tc.args, config.workspace);

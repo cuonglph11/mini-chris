@@ -2,7 +2,7 @@ import { mkdir, readFile, appendFile } from 'fs/promises';
 import { join } from 'path';
 import type { ToolDefinition } from '../types.js';
 import { buildIndex, searchMemory } from './search.js';
-import type { MemoryIndex } from './search.js';
+import type { MemoryIndex, EmbeddingConfig } from './search.js';
 
 // ── Tool definitions ────────────────────────────────────────────────────────
 
@@ -61,6 +61,7 @@ export async function executeMemorySearch(
   workspacePath: string,
   apiKey: string,
   embeddingModel?: string,
+  embeddingConfig?: EmbeddingConfig,
 ): Promise<string> {
   const query = args.query as string;
   const maxResults = (args.maxResults as number) ?? 5;
@@ -72,7 +73,7 @@ export async function executeMemorySearch(
   try {
     // Rebuild index if workspace changed or first call
     if (!cachedIndex || cachedWorkspace !== workspacePath) {
-      cachedIndex = await buildIndex(workspacePath, apiKey, embeddingModel);
+      cachedIndex = await buildIndex(workspacePath, apiKey, embeddingModel, embeddingConfig);
       cachedWorkspace = workspacePath;
     }
 

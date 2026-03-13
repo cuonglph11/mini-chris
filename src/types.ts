@@ -77,6 +77,9 @@ export interface AppConfig {
     provider: string;
     model: string;
     apiKey: string;
+    providerOrder: string[];
+    ollamaHost: string;
+    vectraPath: string;
   };
   cursor: {
     binary?: string;

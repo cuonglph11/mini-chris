@@ -4,11 +4,18 @@ cwd: .                             # default working directory
 workspace: ./workspace             # path to workspace dir
 maxToolRounds: 50                  # max tool call rounds per turn
 
-# Embedding for memory search
+# Embedding for memory search (local-first by default)
 embedding:
-  provider: openai
-  model: text-embedding-3-small
-  apiKey: ${OPENAI_API_KEY}        # env var reference
+  provider: ollama                         # ollama | copilot | openai | keyword
+  model: text-embedding-3-small            # OpenAI model (only used when provider=openai)
+  apiKey: ${OPENAI_API_KEY}                # env var reference (only used when provider=openai)
+  providerOrder:                           # fallback chain — tried in order until one works
+    - ollama                               # local Ollama (run models/setup.sh first)
+    - copilot                              # GitHub Copilot embeddings
+    - openai                               # OpenAI API (requires apiKey)
+    - keyword                              # keyword matching (no API needed, always works)
+  ollamaHost: http://localhost:11434       # Ollama server URL
+  # vectraPath: ./workspace/.vectra        # custom path for Vectra vector DB index
 
 # Adapter-specific
 cursor:

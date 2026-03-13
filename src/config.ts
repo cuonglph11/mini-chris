@@ -30,9 +30,12 @@ const AppConfigSchema = z.object({
   maxToolRounds: z.number().int().min(1).default(50),
   embedding: z
     .object({
-      provider: z.string().default('openai'),
+      provider: z.string().default('ollama'),
       model: z.string().default('text-embedding-3-small'),
       apiKey: z.string().default(''),
+      providerOrder: z.array(z.string()).default(['ollama', 'copilot', 'openai', 'keyword']),
+      ollamaHost: z.string().default(process.env.OLLAMA_HOST || 'http://localhost:11434'),
+      vectraPath: z.string().default(''),
     })
     .default({}),
   cursor: z
