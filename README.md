@@ -34,7 +34,8 @@ mini-chris is different: it piggybacks on tools your company **already pays for*
 | **MCP Integration** | Connect to any MCP server (stdio or SSE transport) |
 | **Web UI** | Browser-based chat interface with streaming, history, and tool visibility |
 | **Dual LLM Backend** | Cursor IDE (primary) or GitHub Copilot (fallback) |
-| **Embedding Search** | OpenAI → Copilot → keyword fallback chain for memory search |
+| **Vector DB (Vectra)** | Persistent local vector storage — embeddings cached on disk, only new chunks re-embedded |
+| **Embedding Search** | Configurable fallback chain: Ollama (local) → Copilot → OpenAI → keyword |
 
 ## Quick Start
 
@@ -76,11 +77,18 @@ cwd: .                             # working directory
 workspace: ./workspace             # memory & skills location
 maxToolRounds: 50                  # max tool call rounds per turn
 
-# Embedding for memory search (optional)
+# Embedding for memory search (local-first by default)
 embedding:
-  provider: openai
-  model: text-embedding-3-small
-  apiKey: ${OPENAI_API_KEY}
+  provider: ollama                         # ollama | copilot | openai | keyword
+  model: text-embedding-3-small            # OpenAI model (only when provider=openai)
+  apiKey: ${OPENAI_API_KEY}                # only when provider=openai
+  providerOrder:                           # fallback chain — tried in order
+    - ollama                               # local Ollama (run models/setup.sh first)
+    - copilot                              # GitHub Copilot embeddings
+    - openai                               # OpenAI API (requires apiKey)
+    - keyword                              # keyword matching (always works)
+  ollamaHost: http://localhost:11434       # Ollama server URL
+  # vectraPath: ./workspace/.vectra        # custom Vectra index location
 
 # Cursor-specific
 cursor:
@@ -98,6 +106,7 @@ copilot:
 |----------|---------|
 | `GITHUB_TOKEN` | GitHub Copilot authentication (PAT with `copilot` scope) |
 | `OPENAI_API_KEY` | Memory search embeddings (optional, falls back gracefully) |
+| `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
 | `MINI_CHRIS_ADAPTER` | Override adapter without editing config (`cursor` or `copilot`) |
 
 ## Commands
@@ -216,12 +225,35 @@ The LLM proactively manages memory using built-in tools:
 
 Every 20 conversation turns, a hidden prompt asks the LLM to review and save important context. This prevents information loss in long sessions.
 
-### Embedding Search
+### Embedding Search & Vector Storage
 
-Memory search uses a 3-tier fallback chain:
-1. **OpenAI** embeddings (`text-embedding-3-small`) — best quality
-2. **GitHub Copilot** embeddings — no extra API key needed
-3. **Keyword matching** — works offline, no API required
+Memory search uses [Vectra](https://github.com/Stevenic/vectra) — a local, file-based vector database. Embeddings are persisted to disk at `workspace/.vectra/`, so only new or changed chunks are re-embedded on startup.
+
+The embedding provider is fully configurable with a **local-first** fallback chain:
+
+1. **Ollama** (local, default) — bundled model included, run `models/setup.sh` to install
+2. **GitHub Copilot** embeddings — uses your existing subscription, no extra key
+3. **OpenAI** embeddings (`text-embedding-3-small`) — best quality, requires API key
+4. **Keyword matching** — works offline, no API required, always available
+
+```yaml
+# config.yaml — customize the fallback order
+embedding:
+  providerOrder: [ollama, copilot, openai, keyword]
+  ollamaHost: http://localhost:11434
+```
+
+#### Bundled Embedding Model
+
+A quantized [nomic-embed-text-v1.5](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF) model (~80MB) is included in `models/` via Git LFS. To set it up:
+
+```bash
+git lfs pull                # download the GGUF model file
+cd models/
+./setup.sh                  # creates the Ollama model locally
+```
+
+This works fully offline — no `ollama pull` needed. Ideal for corporate networks that block external model downloads.
 
 ## Skills System
 
@@ -338,6 +370,10 @@ Uses GitHub Copilot's chat completions API:
 ## Project Structure
 
 ```
+models/
+├── nomic-embed-text-v1.5.Q4_K_M.gguf  # Bundled embedding model (Git LFS)
+├── Modelfile                            # Ollama model definition
+└── setup.sh                             # One-command local model setup
 src/
 ├── cli.ts                    # Commander CLI entry point
 ├── config.ts                 # YAML config loader with zod validation
@@ -353,7 +389,7 @@ src/
 │   └── system-tools.ts       # exec, read_file, write_file, web_fetch
 ├── memory/
 │   ├── inject.ts             # Workspace context loader
-│   ├── search.ts             # Embedding + keyword search
+│   ├── search.ts             # Vectra vector DB + embedding search
 │   ├── tools.ts              # memory_search, memory_save tools
 │   ├── flush.ts              # Pre-compaction memory flush
 │   └── persist.ts            # Git sync helpers
@@ -388,6 +424,7 @@ mini-chris is designed for corporate environments where data security matters:
 ### Network Compatible
 - Works behind corporate VPNs, proxies, and firewalls
 - Proxy support via `HTTPS_PROXY` / `HTTP_PROXY` environment variables
+- Embedding model bundled via Git LFS — works without internet access
 - Only outbound connections: `api.githubcopilot.com` (Copilot) or local Cursor CLI
 
 ### Runtime Safety
@@ -403,7 +440,7 @@ mini-chris is designed for corporate environments where data security matters:
 Your PAT needs the `copilot` scope and an active Copilot subscription. The adapter exchanges your PAT for a short-lived Copilot token automatically.
 
 ### Memory search returns no results
-Falls back gracefully: OpenAI → Copilot → keyword. Set `OPENAI_API_KEY` for best results, or it works without any API key using keyword matching.
+Falls back gracefully: Ollama → Copilot → OpenAI → keyword. Run `models/setup.sh` to set up local embeddings, or it works without any setup using keyword matching. Embeddings are cached in `workspace/.vectra/` so subsequent searches are fast.
 
 ### Cursor adapter not found
 Enable Cursor CLI: open Cursor IDE → `Cmd+Shift+P` → "Install 'cursor' command". Or set the path:
@@ -455,6 +492,7 @@ Contributions welcome! Please:
 
 - Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s memory architecture and tool system
 - Built with [Cursor IDE](https://cursor.com) and [GitHub Copilot](https://github.com/features/copilot) as LLM backends
+- Uses [Vectra](https://github.com/Stevenic/vectra) for local vector storage
 - Uses the [Model Context Protocol](https://modelcontextprotocol.io) for tool extensibility
 
 ---
