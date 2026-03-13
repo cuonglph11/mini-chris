@@ -21,7 +21,7 @@ export interface MemoryIndex {
   embeddingCache: Map<string, number[]>;
   apiKey: string;
   model: string;
-  provider: 'openai' | 'copilot' | 'keyword';
+  provider: 'openai' | 'copilot' | 'ollama' | 'keyword';
 }
 
 type EmbedFn = (text: string) => Promise<number[]>;
@@ -94,30 +94,79 @@ function createOpenAIEmbed(apiKey: string, model: string): EmbedFn {
 
 function createCopilotEmbed(): EmbedFn {
   let tokenPromise: Promise<string> | null = null;
+  // Copilot supports these embedding models — try in order
+  const MODELS = ['copilot-text-embedding-ada-002', 'text-embedding-ada-002', 'text-embedding-3-small'];
+
   return async (text: string) => {
     if (!tokenPromise) tokenPromise = getCopilotSessionToken('device');
     const token = await tokenPromise;
 
-    const response = await proxyFetch('https://api.githubcopilot.com/embeddings', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        ...COPILOT_HEADERS,
-      },
-      body: JSON.stringify({
-        model: 'text-embedding-3-small',
-        input: text,
-      }),
-    });
+    let lastError = '';
+    for (const model of MODELS) {
+      const response = await proxyFetch('https://api.githubcopilot.com/embeddings', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          ...COPILOT_HEADERS,
+        },
+        body: JSON.stringify({
+          model,
+          input: [text],
+        }),
+      });
 
-    if (!response.ok) throw new Error(`Copilot embeddings ${response.status}`);
-    const data = await response.json() as { data: Array<{ embedding: number[] }> };
-    return data.data[0].embedding;
+      if (response.ok) {
+        const data = await response.json() as { data: Array<{ embedding: number[] }> };
+        if (data.data?.[0]?.embedding) {
+          return data.data[0].embedding;
+        }
+      }
+
+      lastError = `${model}: ${response.status}`;
+      const body = await response.text().catch(() => '');
+      if (body) lastError += ` ${body.slice(0, 200)}`;
+    }
+
+    throw new Error(`Copilot embeddings failed (${lastError})`);
   };
 }
 
-// ── Keyword search (fallback 3: no API needed) ──────────────────────────────
+// ── Ollama embeddings (fallback 3: local, no API key) ────────────────────────
+
+const OLLAMA_MODELS = ['nomic-embed-text', 'all-minilm', 'mxbai-embed-large'];
+
+function createOllamaEmbed(): EmbedFn {
+  const baseUrl = process.env.OLLAMA_HOST || 'http://localhost:11434';
+
+  return async (text: string) => {
+    let lastError = '';
+    for (const model of OLLAMA_MODELS) {
+      try {
+        const response = await fetch(`${baseUrl}/api/embed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, input: text }),
+        });
+
+        if (response.ok) {
+          const data = await response.json() as { embeddings?: number[][]; embedding?: number[] };
+          // Ollama returns { embeddings: [[...]] } in newer versions, { embedding: [...] } in older
+          const embedding = data.embeddings?.[0] ?? data.embedding;
+          if (embedding && embedding.length > 0) return embedding;
+        }
+
+        lastError = `${model}: ${response.status}`;
+      } catch (e) {
+        lastError = `${model}: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
+    throw new Error(`Ollama embeddings failed (${lastError})`);
+  };
+}
+
+// ── Keyword search (fallback 4: no API needed) ──────────────────────────────
 
 function tokenize(text: string): string[] {
   return text
@@ -190,13 +239,14 @@ export async function buildIndex(
     return { chunks: allChunks, embeddingCache, apiKey, model, provider: 'keyword' };
   }
 
-  // Try embedding providers in order: OpenAI → Copilot → Keyword
-  const providers: Array<{ name: 'openai' | 'copilot'; create: () => EmbedFn }> = [];
+  // Try embedding providers in order: OpenAI → Copilot → Ollama → Keyword
+  const providers: Array<{ name: 'openai' | 'copilot' | 'ollama'; create: () => EmbedFn }> = [];
 
   if (apiKey) {
     providers.push({ name: 'openai', create: () => createOpenAIEmbed(apiKey, model) });
   }
   providers.push({ name: 'copilot', create: () => createCopilotEmbed() });
+  providers.push({ name: 'ollama', create: () => createOllamaEmbed() });
 
   for (const { name, create } of providers) {
     try {
@@ -252,6 +302,8 @@ export async function searchMemory(
       embed = createOpenAIEmbed(apiKey, index.model);
     } else if (index.provider === 'copilot') {
       embed = createCopilotEmbed();
+    } else if (index.provider === 'ollama') {
+      embed = createOllamaEmbed();
     } else {
       return keywordSearch(query, index.chunks, topN);
     }
